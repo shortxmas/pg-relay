@@ -1,4 +1,5 @@
 import { Pool } from "pg"
+import type { JobListFilter, JobPayload, JobRecord, JobStatus } from "./job"
 
 export type PgQueueOptions = {
     // defaults to process.env.DATABASE_URL, read when the queue first connects
@@ -19,6 +20,11 @@ export class PgRelayInitError extends Error{
 const TABLE_NAME = /^[a-z_][a-z0-9_]{0,49}$/
 
 // Every column init creates; an existing table missing any of them belongs to something else.
+// Anything else would make Postgres reject the query instead of finding no job.
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+
+const DEFAULT_LIST_LIMIT = 100
+
 const COLUMNS = [
     "id", "name", "payload", "status", "attempts", "max_retries", "retry_backoff_seconds", "lock_ttl_seconds", "run_after",
     "locked_until", "locked_by", "last_error", "dedupe_key", "created_at", "updated_at", "finished_at",
@@ -66,6 +72,43 @@ export class PgQueue{
         return this.initialized
     }
 
+    /** The job with this id, or null when there isn't one. Creates the table first if needed. */
+    async getJob<TPayload extends JobPayload = JobPayload>(id: string): Promise<JobRecord<TPayload> | null>{
+        await this.init()
+        if(!UUID.test(id)) return null
+        const { rows } = await this.pool.query<JobRow>(`SELECT * FROM ${this.tableName} WHERE id = $1`, [id])
+        return rows[0] ? toJobRecord<TPayload>(rows[0]) : null
+    }
+
+    /** Jobs matching every field of `filter`, newest first. Creates the table first if needed. */
+    async listJobs<TPayload extends JobPayload = JobPayload>(filter: JobListFilter = {}): Promise<JobRecord<TPayload>[]>{
+        const limit = filter.limit ?? DEFAULT_LIST_LIMIT
+        if(!Number.isInteger(limit) || limit < 1){
+            throw new Error(`pg-relay: limit must be a whole number of 1 or more, got ${limit}`)
+        }
+        await this.init()
+
+        const conditions: string[] = []
+        const values: unknown[] = []
+        const where = (sql: string, value: unknown) => {
+            values.push(value)
+            conditions.push(sql.replace("?", `$${values.length}`))
+        }
+        if(filter.name !== undefined) where("name = ?", filter.name)
+        if(filter.status !== undefined) where("status = ANY(?)", ([] as JobStatus[]).concat(filter.status))
+        if(filter.dedupeKey !== undefined) where("dedupe_key = ?", filter.dedupeKey)
+        values.push(limit)
+
+        const { rows } = await this.pool.query<JobRow>(
+            `SELECT * FROM ${this.tableName}
+             ${conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : ""}
+             ORDER BY created_at DESC, id
+             LIMIT $${values.length}`,
+            values,
+        )
+        return rows.map((row) => toJobRecord<TPayload>(row))
+    }
+
     /** Ends the pool if this queue opened it. */
     async close(): Promise<void>{
         if(this.ownsPool && this.connection) await this.connection.end()
@@ -109,6 +152,46 @@ export class PgQueue{
         }finally{
             client.release()
         }
+    }
+}
+
+type JobRow = {
+    id: string
+    name: string
+    payload: JobPayload
+    status: JobStatus
+    attempts: number
+    max_retries: number
+    retry_backoff_seconds: number
+    lock_ttl_seconds: number
+    run_after: Date
+    locked_until: Date | null
+    locked_by: string | null
+    last_error: string | null
+    dedupe_key: string | null
+    created_at: Date
+    updated_at: Date
+    finished_at: Date | null
+}
+
+function toJobRecord<TPayload extends JobPayload>(row: JobRow): JobRecord<TPayload>{
+    return {
+        id: row.id,
+        name: row.name,
+        payload: row.payload as TPayload,
+        status: row.status,
+        attempts: row.attempts,
+        maxRetries: row.max_retries,
+        retryBackoffSeconds: row.retry_backoff_seconds,
+        lockTtlSeconds: row.lock_ttl_seconds,
+        runAfter: row.run_after,
+        lockedUntil: row.locked_until,
+        lockedBy: row.locked_by,
+        lastError: row.last_error,
+        dedupeKey: row.dedupe_key,
+        createdAt: row.created_at,
+        updatedAt: row.updated_at,
+        finishedAt: row.finished_at,
     }
 }
 

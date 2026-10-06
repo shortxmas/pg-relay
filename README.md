@@ -151,6 +151,48 @@ Every job has to be finished with exactly one call to `complete` or `fail`:
 - When a worker dies, its job's lock expires and the job is claimed again by the normal poll. There's no separate sweep.
 - If the attempt that died was the job's last, the job is marked `failed` ("worker stopped during the final attempt") instead of running again.
 
+## Checking on jobs
+
+To show users where a job is, for example a status badge or a progress page, read it back from the queue. The app and the worker can both do this:
+
+```ts
+queue.getJob(id: string): Promise<JobRecord | null>
+queue.listJobs(filter?: JobListFilter): Promise<JobRecord[]>
+
+type JobListFilter = {
+  name?: string
+  status?: JobStatus | JobStatus[]   // e.g. ["pending", "running"]
+  dedupeKey?: string
+  limit?: number                     // default 100
+}
+```
+
+`getJob` returns `null` for an id that doesn't exist, including one that isn't a uuid. `listJobs` returns the jobs matching every field you set, newest first. Both create the table first if needed. A `JobRecord` is the job's row in camelCase: `status`, `attempts`, `maxRetries`, `runAfter`, `lastError`, `finishedAt`, and so on (see [The table](#the-table)).
+
+Everything a UI needs can be worked out from the record:
+
+```ts
+import type { JobRecord } from "pg-relay"
+
+function describeJob(job: JobRecord): string {
+  const total = job.maxRetries + 1
+  switch (job.status) {
+    case "succeeded": return "Done"
+    case "failed":    return `Failed: ${job.lastError}`
+    case "running":   return `Running (attempt ${job.attempts}/${total})`
+    case "pending": {
+      if (job.attempts === 0) return "Queued"
+      const secs = Math.max(0, Math.ceil((job.runAfter.getTime() - Date.now()) / 1000))
+      return `Attempt ${job.attempts}/${total} failed (${job.lastError}), retrying in ${secs}s`
+    }
+  }
+}
+```
+
+- A `pending` job with `attempts > 0` is waiting to be retried. `runAfter` is when it becomes due, and `lastError` says why the last attempt failed.
+- `runAfter` comes from the database's clock, so "retrying in N seconds" is off by however far your server's clock drifts from it.
+- A `running` job whose worker died still shows `running` until its lock (`lockedUntil`) expires and another worker claims it.
+
 ## Connecting
 
 ```ts
@@ -164,7 +206,7 @@ new PgQueue("jobs", { pool })                              // your own pg.Pool
 
 ## The table
 
-The table is created by `queue.init()`. You rarely need to call `init()` yourself, because the first `writeJob` (and, later, `listen`) calls it.
+The table is created by `queue.init()`. You rarely need to call `init()` yourself, because the first `writeJob`, `listen`, `getJob` or `listJobs` calls it.
 
 - Init runs inside a transaction holding a Postgres advisory lock, so the app and the worker can both start at once without colliding.
 - It creates the table and indexes if they're missing and leaves existing rows alone.

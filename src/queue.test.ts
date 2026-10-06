@@ -1,4 +1,5 @@
 import { Pool } from "pg"
+import { DEFAULT_JOB_CONFIG, Publisher } from "./publisher"
 import { PgQueue, PgRelayInitError } from "./queue"
 import { DATABASE_URL, useTestDb } from "./testing/db"
 
@@ -166,5 +167,117 @@ describe("close", () => {
 
     it("does nothing when the queue never connected", async () => {
         await expect(new PgQueue(tableName()).close()).resolves.toBeUndefined()
+    })
+})
+
+describe("getJob", () => {
+    it("returns a written job as a JobRecord", async () => {
+        const q = queue()
+        const { id } = await new Publisher(q).writeJob("send-email", {
+            payload: { to: "a@b.co" },
+            config: { maxRetries: 2 },
+            dedupeKey: "k",
+        })
+
+        expect(await q.getJob(id)).toEqual({
+            id,
+            name: "send-email",
+            payload: { to: "a@b.co" },
+            status: "pending",
+            attempts: 0,
+            maxRetries: 2,
+            retryBackoffSeconds: DEFAULT_JOB_CONFIG.retryBackoffSeconds,
+            lockTtlSeconds: DEFAULT_JOB_CONFIG.lockTtlSeconds,
+            runAfter: expect.any(Date),
+            lockedUntil: null,
+            lockedBy: null,
+            lastError: null,
+            dedupeKey: "k",
+            createdAt: expect.any(Date),
+            updatedAt: expect.any(Date),
+            finishedAt: null,
+        })
+    })
+
+    it("shows a job waiting for a retry", async () => {
+        const table = tableName()
+        const q = queue(table)
+        const { id } = await new Publisher(q).writeJob("send-email")
+        await admin.query(
+            `UPDATE ${table} SET attempts = 2, last_error = 'boom', run_after = now() + interval '60 seconds' WHERE id = $1`,
+            [id],
+        )
+
+        const job = await q.getJob(id)
+
+        expect(job).toMatchObject({ status: "pending", attempts: 2, lastError: "boom" })
+        expect(job!.runAfter.getTime()).toBeGreaterThan(Date.now() + 50_000)
+    })
+
+    it("returns null for an id that isn't in the table", async () => {
+        expect(await queue().getJob("00000000-0000-0000-0000-000000000000")).toBeNull()
+    })
+
+    it("returns null for an id that isn't a uuid", async () => {
+        expect(await queue().getJob("nope")).toBeNull()
+    })
+})
+
+describe("listJobs", () => {
+    /** A queue holding three jobs, written oldest first: a, b (dedupeKey "x"), then another a. */
+    async function seeded(){
+        const table = tableName()
+        const q = queue(table)
+        const publisher = new Publisher(q)
+        const first = await publisher.writeJob("a")
+        const second = await publisher.writeJob("b", { dedupeKey: "x" })
+        const third = await publisher.writeJob("a")
+        await admin.query(`UPDATE ${table} SET status = 'failed', finished_at = now() WHERE id = $1`, [first.id])
+        return { q, ids: [first.id, second.id, third.id] }
+    }
+
+    it("returns every job, newest first", async () => {
+        const { q, ids } = await seeded()
+
+        expect((await q.listJobs()).map((job) => job.id)).toEqual([...ids].reverse())
+    })
+
+    it("filters by name", async () => {
+        const { q, ids } = await seeded()
+
+        expect((await q.listJobs({ name: "a" })).map((job) => job.id)).toEqual([ids[2], ids[0]])
+    })
+
+    it("filters by one status or several", async () => {
+        const { q, ids } = await seeded()
+
+        expect((await q.listJobs({ status: "failed" })).map((job) => job.id)).toEqual([ids[0]])
+        expect((await q.listJobs({ status: ["pending", "running"] })).map((job) => job.id)).toEqual([ids[2], ids[1]])
+    })
+
+    it("filters by dedupeKey", async () => {
+        const { q, ids } = await seeded()
+
+        expect((await q.listJobs({ dedupeKey: "x" })).map((job) => job.id)).toEqual([ids[1]])
+    })
+
+    it("returns at most limit jobs", async () => {
+        const { q, ids } = await seeded()
+
+        expect((await q.listJobs({ limit: 2 })).map((job) => job.id)).toEqual([ids[2], ids[1]])
+    })
+
+    it.each([0, -1, 1.5])("rejects the limit %p", async (limit) => {
+        await expect(queue().listJobs({ limit })).rejects.toThrow(/limit/)
+    })
+
+    it("returns JobRecords", async () => {
+        const { q } = await seeded()
+
+        expect((await q.listJobs({ status: "failed" }))[0]).toMatchObject({ name: "a", finishedAt: expect.any(Date) })
+    })
+
+    it("creates the table if needed", async () => {
+        expect(await queue().listJobs()).toEqual([])
     })
 })

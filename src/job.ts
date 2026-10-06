@@ -26,8 +26,16 @@ export type JobConditions<TPayload extends JobPayload = JobPayload> = {
 
 export type JobStatus = "pending" | "running" | "succeeded" | "failed"
 
-/** A row of the queue's table. */
-export type JobRecord<TPayload extends JobPayload = JobPayload> = Required<JobConfig> & {
+export type JobListFilter = {
+    name?: string
+    status?: JobStatus | JobStatus[]
+    dedupeKey?: string
+    // most jobs returned, newest first; defaults to 100
+    limit?: number
+}
+
+/** A row of the queue's table. delaySeconds isn't stored: it only ever set the first runAfter. */
+export type JobRecord<TPayload extends JobPayload = JobPayload> = Omit<Required<JobConfig>, "delaySeconds"> & {
     id: string
     name: string
     payload: TPayload
