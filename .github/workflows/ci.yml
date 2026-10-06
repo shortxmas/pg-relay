@@ -47,7 +47,7 @@ jobs:
       - run: npm test
       - run: npm run build
 
-  # Publishes to npm when a push to main has [major], [minor] or [patch] in any of its commit messages,
+  # Publishes to npm when a push to main has [major], [minor] or [patch] in any of its commit titles,
   # then commits the new version back to main with [skip ci] so the push doesn't start another run, and
 # creates a GitHub release tagged vX.Y.Z.
   release:
@@ -60,15 +60,16 @@ jobs:
       id-token: write # npm provenance
 
     steps:
-      - name: Pick the version bump from the commit messages
+      - name: Pick the version bump from the commit titles
         id: bump
         env:
           COMMITS: ${{ toJSON(github.event.commits) }}
+        # Titles only, so a commit body that describes the tags doesn't trigger a release.
         run: |
-          messages=$(jq -r '.[].message' <<< "$COMMITS")
+          titles=$(jq -r '.[].message | split("\n")[0]' <<< "$COMMITS")
           bump=""
           for level in major minor patch; do
-            if grep -qiF "[$level]" <<< "$messages"; then
+            if grep -qiF "[$level]" <<< "$titles"; then
               bump=$level
               break
             fi
