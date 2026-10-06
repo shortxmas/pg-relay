@@ -1,0 +1,9 @@
+{
+  "extends": "./tsconfig.json",
+  // The package ships dist/ only, so maps pointing back at src/ would dangle.
+  "compilerOptions": {
+    "sourceMap": false,
+    "declarationMap": false
+  },
+  "exclude": ["src/**/*.test.ts", "src/testing/**"]
+}

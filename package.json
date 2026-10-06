@@ -1,24 +1,53 @@
 {
   "name": "pg-relay",
-  "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
-  "scripts": {
-    "test": "jest",
-    "typecheck": "tsc --noEmit"
-  },
+  "version": "0.1.0",
+  "description": "Postgres-backed job queue: write jobs from your app, run them in a worker",
+  "keywords": [
+    "postgres",
+    "postgresql",
+    "queue",
+    "job-queue",
+    "jobs",
+    "worker",
+    "background-jobs",
+    "skip-locked"
+  ],
+  "license": "MIT",
+  "author": "Leighton Miguel",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/shortxmas/pg-relay.git"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
-  "type": "commonjs",
   "bugs": {
     "url": "https://github.com/shortxmas/pg-relay/issues"
   },
   "homepage": "https://github.com/shortxmas/pg-relay#readme",
+  "type": "commonjs",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "rm -rf dist && tsc -p tsconfig.build.json",
+    "prepublishOnly": "npm run build",
+    "test": "jest",
+    "typecheck": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "@types/pg": "^8",
+    "pg": "^8"
+  },
   "devDependencies": {
     "@swc/core": "^1.16.13",
     "@swc/jest": "^0.2.39",
@@ -26,10 +55,8 @@
     "@types/node": "^26.6.4",
     "@types/pg": "^8.23.1",
     "jest": "^30.5.2",
+    "pg": "^8.23.1",
     "tsx": "^4.23.15",
     "typescript": "5.9.3"
-  },
-  "dependencies": {
-    "pg": "^8.23.1"
   }
 }

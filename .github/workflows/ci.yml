@@ -1,0 +1,134 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Superseded PR runs are cancelled. Runs on main are never cancelled, so a release can't stop mid-publish.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    # Throwaway Postgres for the integration tests; it's discarded when the job ends.
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: pg_relay_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d pg_relay_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      TEST_DB_URL: postgres://postgres:postgres@localhost:5432/pg_relay_test
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+
+  # Publishes to npm when a push to main has [major], [minor] or [patch] in any of its commit messages,
+  # then commits the new version back to main with [skip ci] so the push doesn't start another run, and
+# creates a GitHub release tagged vX.Y.Z.
+  release:
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write # push the version commit back to main
+      id-token: write # npm provenance
+
+    steps:
+      - name: Pick the version bump from the commit messages
+        id: bump
+        env:
+          COMMITS: ${{ toJSON(github.event.commits) }}
+        run: |
+          messages=$(jq -r '.[].message' <<< "$COMMITS")
+          bump=""
+          for level in major minor patch; do
+            if grep -qiF "[$level]" <<< "$messages"; then
+              bump=$level
+              break
+            fi
+          done
+          echo "bump=$bump" >> "$GITHUB_OUTPUT"
+          echo "Version bump: ${bump:-none, not releasing}"
+
+      - uses: actions/checkout@v4
+        if: steps.bump.outputs.bump != ''
+
+      - uses: actions/setup-node@v4
+        if: steps.bump.outputs.bump != ''
+        with:
+          node-version: 24
+          cache: npm
+          registry-url: https://registry.npmjs.org
+
+      - run: npm ci
+        if: steps.bump.outputs.bump != ''
+
+      - name: Bump the version in package.json
+        id: version
+        if: steps.bump.outputs.bump != ''
+        env:
+          BUMP: ${{ steps.bump.outputs.bump }}
+        run: |
+          version=$(npm version "$BUMP" --no-git-tag-version)
+          echo "version=${version#v}" >> "$GITHUB_OUTPUT"
+          echo "Releasing ${version}"
+
+      - name: Build and publish to npm
+        id: publish
+        if: steps.bump.outputs.bump != ''
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          npm run build
+          npm publish --provenance --access public
+
+      - name: Commit the new version to main
+        id: commit
+        if: steps.bump.outputs.bump != ''
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add package.json package-lock.json
+          git commit -m "Release v${VERSION} [skip ci]"
+          # Another push may have landed on main while this ran.
+          git pull --rebase origin main
+          git push origin HEAD:main
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      # Runs only when npm publish succeeded, even if the version commit failed: the release then
+      # points at the commit that triggered this run instead of the version commit.
+      - name: Create the GitHub release
+        if: always() && steps.publish.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+          TARGET: ${{ steps.commit.outputs.sha || github.sha }}
+        run: gh release create "v${VERSION}" --target "$TARGET" --title "v${VERSION}" --generate-notes
