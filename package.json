@@ -1,0 +1,35 @@
+{
+  "name": "pg-relay",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "jest",
+    "typecheck": "tsc --noEmit"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/shortxmas/pg-relay.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/shortxmas/pg-relay/issues"
+  },
+  "homepage": "https://github.com/shortxmas/pg-relay#readme",
+  "devDependencies": {
+    "@swc/core": "^1.16.13",
+    "@swc/jest": "^0.2.39",
+    "@types/jest": "^30.0.0",
+    "@types/node": "^26.6.4",
+    "@types/pg": "^8.23.1",
+    "jest": "^30.5.2",
+    "tsx": "^4.23.15",
+    "typescript": "5.9.3"
+  },
+  "dependencies": {
+    "pg": "^8.23.1"
+  }
+}
