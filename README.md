@@ -12,10 +12,15 @@ There is no broker. A job is a row: publishing inserts it, and the worker claims
 ## Install
 
 ```sh
-npm install pg-relay pg
+npm install pg-relay
 ```
 
-`pg` (node-postgres 8) and `@types/pg` are peer dependencies, so your app and pg-relay share one copy. npm installs `@types/pg` automatically. Requires Node 18+ and Postgres 13+.
+`pg` (node-postgres 8) and `@types/pg` are peer dependencies, so your app and pg-relay share one copy, and the app chooses the `pg` version.
+- npm 7+ and pnpm install them for you.
+- Yarn doesn't, so add them yourself: `yarn add pg-relay pg @types/pg`.
+- If your app imports `pg` itself, list it in your own `package.json` as usual.
+
+Requires Node 18+ and Postgres 13+.
 
 ## Usage
 
