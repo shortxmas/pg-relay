@@ -520,3 +520,29 @@ describe("a queue in its own schema", () => {
     })
 })
 
+// Compile-time checks, enforced by `npm run typecheck`; never called.
+describe("job name types", () => {
+    it("takes the queue's job names and narrows job.name to the one listened for", () => {
+        const checks = async (queue: PgQueue<"generate-summary" | "send-email">) => {
+            const subscriber = new Subscriber(queue)
+            await subscriber.listen("send-email", async (job) => {
+                const name: "send-email" = job.name
+                await job.complete()
+                return name
+            })
+            // @ts-expect-error not one of the queue's job names
+            await subscriber.listen("send-emial", async () => {})
+        }
+        expect(checks).toBeInstanceOf(Function)
+    })
+
+    it("takes any name when the queue doesn't list them", () => {
+        const checks = async (queue: PgQueue) => {
+            await new Subscriber(queue).listen("anything", async (job) => {
+                const name: string = job.name
+                return name
+            })
+        }
+        expect(checks).toBeInstanceOf(Function)
+    })
+})

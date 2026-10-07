@@ -21,16 +21,16 @@ export type WriteResult = {
 // How often a dedupe write retries when the conflicting job finishes between its insert and select.
 const DEDUPE_ATTEMPTS = 3
 
-/** Writes jobs to a queue. Used by the app runtime. */
-export class Publisher{
-    readonly queue: PgQueue
+/** Writes jobs to a queue. Used by the app runtime. Takes the queue's job names, if it lists them. */
+export class Publisher<TName extends string = string>{
+    readonly queue: PgQueue<TName>
 
-    constructor(queue: PgQueue){
+    constructor(queue: PgQueue<TName>){
         this.queue = queue
     }
 
     /** Writes a pending job called `name`, creating the queue's table first if needed. */
-    async writeJob(name: string, conditions: JobConditions = {}): Promise<WriteResult>{
+    async writeJob(name: TName, conditions: JobConditions = {}): Promise<WriteResult>{
         if(!name) throw new Error("pg-relay: a job needs a name")
         if(conditions.dedupeKey === "") throw new Error("pg-relay: dedupeKey can't be empty")
         const config = { ...DEFAULT_JOB_CONFIG, ...conditions.config }

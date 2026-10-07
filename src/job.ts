@@ -26,8 +26,8 @@ export type JobConditions<TPayload extends JobPayload = JobPayload> = {
 
 export type JobStatus = "pending" | "running" | "succeeded" | "failed"
 
-export type JobListFilter = {
-    name?: string
+export type JobListFilter<TName extends string = string> = {
+    name?: TName
     status?: JobStatus | JobStatus[]
     dedupeKey?: string
     // jobs whose payload contains these fields and values (Postgres jsonb @>)
@@ -45,18 +45,18 @@ export type JobListFilter = {
 }
 
 /** Which finished jobs pruneJobs deletes. */
-export type PruneJobsOptions = {
+export type PruneJobsOptions<TName extends string = string> = {
     // delete jobs that finished more than this many seconds ago
     olderThanSeconds: number
     // defaults to both finished statuses
     status?: "succeeded" | "failed" | ("succeeded" | "failed")[]
-    name?: string
+    name?: TName
 }
 
 /** A row of the queue's table. delaySeconds isn't stored: it only ever set the first runAfter. */
-export type JobRecord<TPayload extends JobPayload = JobPayload> = Omit<Required<JobConfig>, "delaySeconds"> & {
+export type JobRecord<TPayload extends JobPayload = JobPayload, TName extends string = string> = Omit<Required<JobConfig>, "delaySeconds"> & {
     id: string
-    name: string
+    name: TName
     payload: TPayload
     status: JobStatus
     // runs started so far, counting the one in progress

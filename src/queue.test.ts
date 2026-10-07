@@ -576,3 +576,36 @@ describe("retryJob", () => {
     })
 })
 
+// Compile-time checks, enforced by `npm run typecheck`. The functions are never called, so nothing
+// touches the database; each test only asserts that the checks were defined.
+describe("job name types", () => {
+    type Name = "generate-summary" | "send-email"
+
+    it("limits names in filters and records to the queue's job names", () => {
+        const checks = async (q: PgQueue<Name>) => {
+            await q.listJobs({ name: "send-email" })
+            // @ts-expect-error not one of the queue's job names
+            await q.listJobs({ name: "send-emial" })
+            await q.pruneJobs({ olderThanSeconds: 60, name: "generate-summary" })
+            // @ts-expect-error not one of the queue's job names
+            await q.pruneJobs({ olderThanSeconds: 60, name: "nope" })
+
+            const listed: Name = (await q.listJobs())[0].name
+            const fetched: Name | undefined = (await q.getJob("id"))?.name
+            const retried: Name | undefined = (await q.retryJob("id"))?.name
+            // @ts-expect-error a record's name is one of the queue's names, not any string
+            const narrow: "send-email" = (await q.listJobs())[0].name
+            return [listed, fetched, retried, narrow]
+        }
+        expect(checks).toBeInstanceOf(Function)
+    })
+
+    it("accepts any name when the queue doesn't list them", () => {
+        const checks = async (q: PgQueue) => {
+            await q.listJobs({ name: "anything" })
+            const name: string = (await q.listJobs())[0].name
+            return name
+        }
+        expect(checks).toBeInstanceOf(Function)
+    })
+})

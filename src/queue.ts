@@ -40,8 +40,11 @@ const COLUMNS = [
 /**
  * The table jobs are written to and claimed from, and the connection to it. Constructing one does no
  * I/O and needs no DATABASE_URL, so a module that creates it can be imported anywhere.
+ *
+ * TName optionally lists the queue's job names, e.g. PgQueue<"generate-summary" | "send-email">. It's
+ * checked at compile time only; Publisher and Subscriber infer it from the queue.
  */
-export class PgQueue{
+export class PgQueue<TName extends string = string>{
     readonly tableName: string
     readonly schema?: string
     // the table as SQL refers to it: "schema.table", or "table" without a schema
@@ -88,15 +91,15 @@ export class PgQueue{
     }
 
     /** The job with this id, or null when there isn't one. Creates the table first if needed. */
-    async getJob<TPayload extends JobPayload = JobPayload>(id: string): Promise<JobRecord<TPayload> | null>{
+    async getJob<TPayload extends JobPayload = JobPayload>(id: string): Promise<JobRecord<TPayload, TName> | null>{
         await this.init()
         if(!UUID.test(id)) return null
         const { rows } = await this.pool.query<JobRow>(`SELECT * FROM ${this.qualifiedTableName} WHERE id = $1`, [id])
-        return rows[0] ? toJobRecord<TPayload>(rows[0]) : null
+        return rows[0] ? toJobRecord<TPayload, TName>(rows[0]) : null
     }
 
     /** Jobs matching every field of `filter`, newest first. Creates the table first if needed. */
-    async listJobs<TPayload extends JobPayload = JobPayload>(filter: JobListFilter = {}): Promise<JobRecord<TPayload>[]>{
+    async listJobs<TPayload extends JobPayload = JobPayload>(filter: JobListFilter<TName> = {}): Promise<JobRecord<TPayload, TName>[]>{
         const limit = filter.limit ?? DEFAULT_LIST_LIMIT
         const offset = filter.offset ?? 0
         assertCount("limit", limit, 1)
@@ -132,14 +135,14 @@ export class PgQueue{
              LIMIT $${values.length - 1} OFFSET $${values.length}`,
             values,
         )
-        return rows.map((row) => toJobRecord<TPayload>(row))
+        return rows.map((row) => toJobRecord<TPayload, TName>(row))
     }
 
     /**
      * Deletes succeeded and failed jobs that finished more than `olderThanSeconds` ago, optionally
      * only those with `status` or `name`. Pending and running jobs are never deleted. Returns how many.
      */
-    async pruneJobs(options: PruneJobsOptions): Promise<number>{
+    async pruneJobs(options: PruneJobsOptions<TName>): Promise<number>{
         assertCount("olderThanSeconds", options.olderThanSeconds)
         const statuses = ([] as JobStatus[]).concat(options.status ?? FINISHED)
         if(statuses.length === 0 || statuses.some((status) => !FINISHED.includes(status))){
@@ -162,7 +165,7 @@ export class PgQueue{
      * again. lastError is kept for reference. Returns the updated job, or null when there's no failed job
      * with this id. Rejects if another unfinished job already holds the job's dedupeKey.
      */
-    async retryJob<TPayload extends JobPayload = JobPayload>(id: string): Promise<JobRecord<TPayload> | null>{
+    async retryJob<TPayload extends JobPayload = JobPayload>(id: string): Promise<JobRecord<TPayload, TName> | null>{
         await this.init()
         if(!UUID.test(id)) return null
         try{
@@ -174,7 +177,7 @@ export class PgQueue{
                  RETURNING *`,
                 [id],
             )
-            return rows[0] ? toJobRecord<TPayload>(rows[0]) : null
+            return rows[0] ? toJobRecord<TPayload, TName>(rows[0]) : null
         }catch(error){
             if((error as { code?: string }).code === "23505"){
                 throw new Error(`pg-relay: can't retry job ${id}: an unfinished job with the same name and dedupeKey exists`, { cause: error })
@@ -249,10 +252,10 @@ type JobRow = {
     finished_at: Date | null
 }
 
-function toJobRecord<TPayload extends JobPayload>(row: JobRow): JobRecord<TPayload>{
+function toJobRecord<TPayload extends JobPayload, TName extends string>(row: JobRow): JobRecord<TPayload, TName>{
     return {
         id: row.id,
-        name: row.name,
+        name: row.name as TName,
         payload: row.payload as TPayload,
         status: row.status,
         attempts: row.attempts,

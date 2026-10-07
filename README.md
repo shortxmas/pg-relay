@@ -73,6 +73,24 @@ for (const signal of ["SIGTERM", "SIGINT"] as const) {
 
 `listen` creates the table if needed, then starts polling and resolves. If the table can't be set up, it rejects, so an unhandled rejection stops the worker before it ever polls. pg-relay never installs signal handlers or calls `process.exit` itself.
 
+### Typed job names
+
+Optionally, list the queue's job names as a union. Nothing changes at runtime: names are only checked when your code compiles.
+
+```ts
+// queue.ts
+type JobName = "generate-summary" | "send-email"
+
+const queue = new PgQueue<JobName>("jobs")
+export const publisher = new Publisher(queue)    // inferred: Publisher<JobName>
+export const subscriber = new Subscriber(queue)  // inferred: Subscriber<JobName>
+```
+
+- `writeJob` and `listen` only accept those names, so `publisher.writeJob("send-emial")` is a compile error.
+- The `name` filters of `listJobs` and `pruneJobs` are checked the same way, and the `name` of every returned `JobRecord` is typed as `JobName`.
+- Inside `listen("send-email", (job) => …)`, `job.name` is typed as `"send-email"`.
+- Without the type argument, any string works.
+
 ## Writing jobs
 
 ```ts

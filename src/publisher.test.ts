@@ -243,3 +243,23 @@ describe("a queue in its own schema", () => {
         expect(rows).toEqual([{ id: first.id }])
     })
 })
+
+// Compile-time checks, enforced by `npm run typecheck`; never called.
+describe("job name types", () => {
+    it("takes the queue's job names, inferred from the queue", () => {
+        const checks = async (queue: PgQueue<"generate-summary" | "send-email">) => {
+            const publisher = new Publisher(queue)
+            await publisher.writeJob("send-email", { payload: { to: "a@b.co" } })
+            // @ts-expect-error not one of the queue's job names
+            await publisher.writeJob("send-emial")
+        }
+        expect(checks).toBeInstanceOf(Function)
+    })
+
+    it("takes any name when the queue doesn't list them", () => {
+        const checks = async (queue: PgQueue) => {
+            await new Publisher(queue).writeJob("anything")
+        }
+        expect(checks).toBeInstanceOf(Function)
+    })
+})

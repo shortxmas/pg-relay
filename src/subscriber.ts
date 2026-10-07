@@ -32,9 +32,9 @@ export type FailOptions = {
 }
 
 /** A job the subscriber claimed, handed to the handler with the means to finish it. */
-export type ClaimedJob<TPayload extends JobPayload = JobPayload> = {
+export type ClaimedJob<TPayload extends JobPayload = JobPayload, TName extends string = string> = {
     id: string
-    name: string
+    name: TName
     payload: TPayload
     // runs started so far, counting this one
     attempts: number
@@ -47,7 +47,8 @@ export type ClaimedJob<TPayload extends JobPayload = JobPayload> = {
     fail(error: unknown, options?: FailOptions): Promise<boolean>
 }
 
-export type JobHandler<TPayload extends JobPayload = JobPayload> = (job: ClaimedJob<TPayload>) => unknown
+export type JobHandler<TPayload extends JobPayload = JobPayload, TName extends string = string> =
+    (job: ClaimedJob<TPayload, TName>) => unknown
 
 /** This worker no longer holds the job's lock: it expired and another worker claimed the job. */
 export class LockLostError extends Error{
@@ -77,15 +78,15 @@ type ClaimedRow = {
 }
 
 /** Claims and runs jobs from a queue. Used by the worker. */
-export class Subscriber{
-    readonly queue: PgQueue
+export class Subscriber<TName extends string = string>{
+    readonly queue: PgQueue<TName>
     private readonly config: Required<ListenConfig>
     private readonly logger: SubscriberLogger
     private readonly listening = new Set<string>()
     private readonly loops: Promise<void>[] = []
     private readonly stopping = new AbortController()
 
-    constructor(queue: PgQueue, config: SubscriberConfig = {}){
+    constructor(queue: PgQueue<TName>, config: SubscriberConfig = {}){
         const { logger, ...listenConfig } = config
         this.queue = queue
         this.config = resolveListenConfig(DEFAULT_LISTEN_CONFIG, listenConfig)
@@ -96,9 +97,9 @@ export class Subscriber{
      * Creates the queue's table if needed, then polls for jobs called `name` and hands each to
      * `handler`. Resolves once polling has started; rejects if the table can't be set up.
      */
-    async listen<TPayload extends JobPayload = JobPayload>(
-        name: string,
-        handler: JobHandler<TPayload>,
+    async listen<TPayload extends JobPayload = JobPayload, N extends TName = TName>(
+        name: N,
+        handler: JobHandler<TPayload, N>,
         config: ListenConfig = {},
     ): Promise<void>{
         if(!name) throw new Error("pg-relay: listen needs a job name")
@@ -115,7 +116,7 @@ export class Subscriber{
         }
 
         for(let i = 0; i < concurrency; i++){
-            this.loops.push(this.pollLoop(name, handler as JobHandler, pollIntervalSeconds * 1000))
+            this.loops.push(this.pollLoop(name, handler as unknown as JobHandler, pollIntervalSeconds * 1000))
         }
     }
 
