@@ -305,7 +305,7 @@ await subscriber.listen("generate-summary", async (job) => {
 new PgQueue("jobs")                                        // DATABASE_URL
 new PgQueue("jobs", { connectionString: "postgres://…" })  // explicit URL
 new PgQueue("jobs", { pool })                              // your own pg.Pool
-new PgQueue("jobs", { schema: "pg_relay" })                // table pg_relay.jobs
+new PgQueue("jobs", { schema: "relay" })                   // table relay.jobs
 ```
 
 - `queue.close()` ends the pool only if the queue opened it. A pool you pass in stays open.
@@ -318,12 +318,12 @@ By default the table goes in the connection's current schema, usually `public`, 
 Give pg-relay its own schema instead:
 
 ```ts
-const queue = new PgQueue("jobs", { schema: "pg_relay" })
+const queue = new PgQueue("jobs", { schema: "relay" })
 ```
 
-- `init()` runs `CREATE SCHEMA IF NOT EXISTS pg_relay`, so the database user needs permission to create schemas, or the schema has to exist already.
-- Every query refers to `pg_relay.jobs` directly, whatever the connection's `search_path` is.
-- The schema name must be a lowercase Postgres identifier.
+- `init()` runs `CREATE SCHEMA IF NOT EXISTS relay`, so the database user needs permission to create schemas, or the schema has to exist already.
+- Every query refers to `relay.jobs` directly, whatever the connection's `search_path` is.
+- The schema name must be a lowercase Postgres identifier, and can't start with `pg_`: Postgres reserves that prefix for its own system schemas.
 
 ## The table
 

@@ -61,6 +61,9 @@ export class PgQueue<TName extends string = string>{
         if(options.schema !== undefined && !SCHEMA_NAME.test(options.schema)){
             throw new Error(`pg-relay: schema "${options.schema}" must match ${SCHEMA_NAME}`)
         }
+        if(options.schema?.startsWith("pg_")){
+            throw new Error(`pg-relay: schema "${options.schema}" can't be used: the prefix "pg_" is reserved for Postgres system schemas`)
+        }
         this.tableName = tableName
         this.schema = options.schema
         this.qualifiedTableName = options.schema ? `${options.schema}.${tableName}` : tableName

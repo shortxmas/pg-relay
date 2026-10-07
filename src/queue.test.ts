@@ -28,9 +28,13 @@ describe("constructor", () => {
         expect(() => new PgQueue("jobs", { schema })).toThrow(/schema/)
     })
 
+    it.each(["pg_relay", "pg_catalog", "pg_"])("rejects the reserved schema name %p", (schema) => {
+        expect(() => new PgQueue("jobs", { schema })).toThrow(/"pg_" is reserved/)
+    })
+
     it("names its table with the schema when it has one", () => {
         expect(new PgQueue("jobs").qualifiedTableName).toBe("jobs")
-        expect(new PgQueue("jobs", { schema: "pg_relay" }).qualifiedTableName).toBe("pg_relay.jobs")
+        expect(new PgQueue("jobs", { schema: "relay" }).qualifiedTableName).toBe("relay.jobs")
     })
 
     it("needs neither a connection nor DATABASE_URL until init", () => {
