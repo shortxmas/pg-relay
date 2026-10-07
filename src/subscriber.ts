@@ -143,7 +143,7 @@ export class Subscriber{
     private async processNext(name: string, handler: JobHandler): Promise<boolean>{
         // A fresh token per claim, so acks can only land while this claim still holds the job.
         const lockedBy = `${hostname()}:${process.pid}:${randomUUID().slice(0, 8)}`
-        const table = this.queue.tableName
+        const table = this.queue.qualifiedTableName
         const { rows } = await this.queue.pool.query<ClaimedRow>(
             `UPDATE ${table} AS j
              SET status = 'running',
@@ -232,7 +232,7 @@ export class Subscriber{
     /** Extends the lock by the job's TTL. false when this claim no longer holds the job. */
     private async renewLock(id: string, lockedBy: string): Promise<boolean>{
         const { rowCount } = await this.queue.pool.query(
-            `UPDATE ${this.queue.tableName}
+            `UPDATE ${this.queue.qualifiedTableName}
              SET locked_until = now() + make_interval(secs => lock_ttl_seconds), updated_at = now()
              WHERE id = $1 AND status = 'running' AND locked_by = $2`,
             [id, lockedBy],
@@ -251,7 +251,7 @@ export class Subscriber{
     ): Promise<boolean>{
         const finished = outcome.status !== "pending"
         const { rowCount } = await this.queue.pool.query(
-            `UPDATE ${this.queue.tableName}
+            `UPDATE ${this.queue.qualifiedTableName}
              SET status = $3,
                  last_error = CASE WHEN $3 = 'succeeded' THEN last_error ELSE $4 END,
                  run_after = CASE WHEN $3 = 'pending' THEN now() + make_interval(secs => $5) ELSE run_after END,

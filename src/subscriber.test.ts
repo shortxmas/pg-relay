@@ -500,3 +500,23 @@ describe("stop", () => {
         await expect(subscriber().stop()).resolves.toBeUndefined()
     })
 })
+
+describe("a queue in its own schema", () => {
+    it("claims, retries, renews and finishes jobs in the schema's table", async () => {
+        const schema = db.schemaName()
+        const queue = db.track(new PgQueue(db.tableName(), { connectionString: DATABASE_URL, schema }))
+        const { id } = await new Publisher(queue).writeJob("x", { config: { retryBackoffSeconds: 0, lockTtlSeconds: 1 } })
+        const subscriber = new Subscriber(queue, { pollIntervalSeconds: 0.02, logger: quiet })
+        db.defer(() => subscriber.stop())
+
+        await subscriber.listen("x", async (job) => {
+            if(job.attempts === 1) return void await job.fail(new Error("once"))
+            await sleep(1_200) // longer than the lock TTL: only renewal keeps the job
+            expect(await job.complete()).toBe(true)
+        })
+
+        await waitFor(async () => (await queue.getJob(id))?.status === "succeeded", 6_000)
+        expect(await queue.getJob(id)).toMatchObject({ attempts: 2, lastError: "once" })
+    })
+})
+

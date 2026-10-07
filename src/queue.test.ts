@@ -1,9 +1,10 @@
 import { Pool } from "pg"
 import { DEFAULT_JOB_CONFIG, Publisher } from "./publisher"
 import { PgQueue, PgRelayInitError } from "./queue"
+import { Subscriber } from "./subscriber"
 import { DATABASE_URL, useTestDb } from "./testing/db"
 
-const { admin, tableName, track } = useTestDb()
+const { admin, tableName, schemaName, track } = useTestDb()
 
 /** A queue on DATABASE_URL, closed after each test. */
 function queue(table = tableName()): PgQueue{
@@ -21,6 +22,15 @@ async function columnsOf(table: string): Promise<string[]>{
 describe("constructor", () => {
     it.each(["Jobs", "1jobs", "jobs-x", "jobs x", "", "a".repeat(51)])("rejects the table name %p", (name) => {
         expect(() => new PgQueue(name)).toThrow(/tableName/)
+    })
+
+    it.each(["Jobs", "1x", "a-b", "", "a".repeat(64)])("rejects the schema name %p", (schema) => {
+        expect(() => new PgQueue("jobs", { schema })).toThrow(/schema/)
+    })
+
+    it("names its table with the schema when it has one", () => {
+        expect(new PgQueue("jobs").qualifiedTableName).toBe("jobs")
+        expect(new PgQueue("jobs", { schema: "pg_relay" }).qualifiedTableName).toBe("pg_relay.jobs")
     })
 
     it("needs neither a connection nor DATABASE_URL until init", () => {
@@ -281,3 +291,288 @@ describe("listJobs", () => {
         expect(await queue().listJobs()).toEqual([])
     })
 })
+
+describe("schema", () => {
+    /** A queue whose table lives in a fresh Postgres schema. */
+    function schemaQueue(table = tableName(), schema = schemaName()){
+        return { q: track(new PgQueue(table, { connectionString: DATABASE_URL, schema })), table, schema }
+    }
+
+    it("creates the schema and puts the table and its indexes in it", async () => {
+        const { q, table, schema } = schemaQueue()
+
+        await q.init()
+
+        const tables = await admin.query("SELECT table_schema FROM information_schema.tables WHERE table_name = $1", [table])
+        expect(tables.rows).toEqual([{ table_schema: schema }])
+        const indexes = await admin.query("SELECT count(*)::int AS n FROM pg_indexes WHERE schemaname = $1 AND tablename = $2", [schema, table])
+        expect(indexes.rows[0].n).toBe(4)
+    })
+
+    it("uses a schema that already exists", async () => {
+        const schema = schemaName()
+        await admin.query(`CREATE SCHEMA ${schema}`)
+
+        await expect(schemaQueue(tableName(), schema).q.init()).resolves.toBeUndefined()
+    })
+
+    it("keeps tables of the same name in different schemas apart", async () => {
+        const table = tableName()
+        const a = schemaQueue(table).q
+        const b = schemaQueue(table).q
+
+        const { id } = await new Publisher(a).writeJob("x")
+
+        expect(await a.getJob(id)).not.toBeNull()
+        expect(await b.getJob(id)).toBeNull()
+        expect(await b.listJobs()).toEqual([])
+    })
+
+    it("checks the columns of the table in its own schema", async () => {
+        const { q, table, schema } = schemaQueue()
+        await admin.query(`CREATE SCHEMA ${schema}`)
+        await admin.query(`CREATE TABLE ${schema}.${table} (id int)`)
+
+        await expect(q.init()).rejects.toThrow(/not a pg-relay table/)
+    })
+
+    it("supports reading, pruning and retrying in its schema", async () => {
+        const { q, table, schema } = schemaQueue()
+        const { id } = await new Publisher(q).writeJob("x")
+        await admin.query(`UPDATE ${schema}.${table} SET status = 'failed', finished_at = now() - interval '1 hour'`)
+
+        expect((await q.listJobs({ status: "failed" })).map((job) => job.id)).toEqual([id])
+        expect(await q.retryJob(id)).toMatchObject({ id, status: "pending" })
+        await admin.query(`UPDATE ${schema}.${table} SET status = 'succeeded', finished_at = now() - interval '1 hour'`)
+        expect(await q.pruneJobs({ olderThanSeconds: 60 })).toBe(1)
+    })
+})
+
+describe("listJobs filters", () => {
+    async function withJobs(){
+        const table = tableName()
+        const q = queue(table)
+        const publisher = new Publisher(q)
+        const week1 = await publisher.writeJob("summary", { payload: { rangeStart: "2026-09-28T00:00:00.000Z", source: "CRON" } })
+        const week2 = await publisher.writeJob("summary", { payload: { rangeStart: "2026-10-05T00:00:00.000Z", source: "USER" } })
+        const week3 = await publisher.writeJob("summary", { payload: { rangeStart: "2026-10-12T00:00:00.000Z", source: "USER" } })
+        const other = await publisher.writeJob("export", { payload: { reportId: "r_1" } })
+        // An hour apart, oldest first: written back to back, two could share a millisecond.
+        for(const [hoursAgo, { id }] of [week1, week2, week3, other].reverse().entries()){
+            await admin.query(`UPDATE ${table} SET created_at = now() - make_interval(hours => $2) WHERE id = $1`, [id, hoursAgo])
+        }
+        return { q, table, ids: { week1: week1.id, week2: week2.id, week3: week3.id, other: other.id } }
+    }
+    const ids = (jobs: { id: string }[]) => jobs.map((job) => job.id)
+
+    it("filters by payload fields", async () => {
+        const { q, ids: { week2, week3 } } = await withJobs()
+
+        expect(ids(await q.listJobs({ payload: { source: "USER" } }))).toEqual([week3, week2])
+    })
+
+    it("filters by nested payload fields", async () => {
+        const q = queue()
+        const { id } = await new Publisher(q).writeJob("x", { payload: { report: { id: "r_1", tags: ["a", "b"] } } })
+        await new Publisher(q).writeJob("x", { payload: { report: { id: "r_2" } } })
+
+        expect(ids(await q.listJobs({ payload: { report: { id: "r_1" } } }))).toEqual([id])
+    })
+
+    it("filters by a JSON path condition with variables", async () => {
+        const { q, ids: { week2 } } = await withJobs()
+
+        const jobs = await q.listJobs({
+            name: "summary",
+            payloadPath: {
+                path: "$.rangeStart >= $from && $.rangeStart < $to",
+                vars: { from: "2026-10-05T00:00:00.000Z", to: "2026-10-12T00:00:00.000Z" },
+            },
+        })
+
+        expect(ids(jobs)).toEqual([week2])
+    })
+
+    it("leaves out jobs whose payload lacks the path's fields", async () => {
+        const { q, ids: { week1, week2, week3 } } = await withJobs()
+
+        const jobs = await q.listJobs({ payloadPath: { path: '$.rangeStart >= "2026-01-01"' } })
+
+        expect(ids(jobs)).toEqual([week3, week2, week1])
+    })
+
+    it("rejects an invalid JSON path", async () => {
+        const { q } = await withJobs()
+
+        await expect(q.listJobs({ payloadPath: { path: "$.(" } })).rejects.toThrow()
+    })
+
+    it("filters by when jobs were created", async () => {
+        const { q, table, ids: { week1, week2, week3, other } } = await withJobs()
+        const at = async (id: string) => (await admin.query(`SELECT created_at FROM ${table} WHERE id = $1`, [id])).rows[0].created_at as Date
+
+        expect(ids(await q.listJobs({ createdAfter: await at(week2) }))).toEqual([other, week3])
+        expect(ids(await q.listJobs({ createdBefore: await at(week2) }))).toEqual([week1])
+        expect(ids(await q.listJobs({ createdAfter: await at(week1), createdBefore: await at(other) }))).toEqual([week3, week2])
+    })
+
+    it("skips offset jobs", async () => {
+        const { q, ids: { week1, week2 } } = await withJobs()
+
+        expect(ids(await q.listJobs({ limit: 2, offset: 2 }))).toEqual([week2, week1])
+        expect(await q.listJobs({ offset: 10 })).toEqual([])
+    })
+
+    it.each([-1, 1.5])("rejects the offset %p", async (offset) => {
+        await expect(queue().listJobs({ offset })).rejects.toThrow(/offset/)
+    })
+
+    it("combines every filter", async () => {
+        const { q, ids: { week3 } } = await withJobs()
+
+        const jobs = await q.listJobs({
+            name: "summary",
+            status: "pending",
+            payload: { source: "USER" },
+            payloadPath: { path: "$.rangeStart >= $from", vars: { from: "2026-10-10" } },
+        })
+
+        expect(ids(jobs)).toEqual([week3])
+    })
+})
+
+describe("pruneJobs", () => {
+    /** One job in every status; the finished ones finished `hoursAgo` hours ago. */
+    async function withEveryStatus(hoursAgo = 2){
+        const table = tableName()
+        const q = queue(table)
+        const publisher = new Publisher(q)
+        const job = async (name: string, status: string) => {
+            const { id } = await publisher.writeJob(name)
+            const finished = status === "succeeded" || status === "failed"
+            await admin.query(
+                `UPDATE ${table} SET status = $2, finished_at = CASE WHEN $3 THEN now() - make_interval(hours => $4) END WHERE id = $1`,
+                [id, status, finished, hoursAgo],
+            )
+            return id
+        }
+        return {
+            q,
+            ids: {
+                pending: await job("a", "pending"),
+                running: await job("a", "running"),
+                succeeded: await job("a", "succeeded"),
+                failed: await job("b", "failed"),
+            },
+        }
+    }
+    const remaining = async (q: PgQueue) => (await q.listJobs()).map((job) => job.status).sort()
+
+    it("deletes succeeded and failed jobs that finished before the cutoff and returns how many", async () => {
+        const { q } = await withEveryStatus()
+
+        expect(await q.pruneJobs({ olderThanSeconds: 3600 })).toBe(2)
+        expect(await remaining(q)).toEqual(["pending", "running"])
+    })
+
+    it("keeps finished jobs newer than the cutoff", async () => {
+        const { q } = await withEveryStatus()
+
+        expect(await q.pruneJobs({ olderThanSeconds: 3 * 3600 })).toBe(0)
+        expect(await remaining(q)).toEqual(["failed", "pending", "running", "succeeded"])
+    })
+
+    it("deletes only the given status", async () => {
+        const { q } = await withEveryStatus()
+
+        expect(await q.pruneJobs({ olderThanSeconds: 3600, status: "succeeded" })).toBe(1)
+        expect(await remaining(q)).toEqual(["failed", "pending", "running"])
+    })
+
+    it("deletes only the given job name", async () => {
+        const { q } = await withEveryStatus()
+
+        expect(await q.pruneJobs({ olderThanSeconds: 3600, name: "b" })).toBe(1)
+        expect(await remaining(q)).toEqual(["pending", "running", "succeeded"])
+    })
+
+    it.each([
+        [{ olderThanSeconds: -1 }, /olderThanSeconds/],
+        [{ olderThanSeconds: 1.5 }, /olderThanSeconds/],
+        [{ olderThanSeconds: 60, status: "pending" }, /status/],
+        [{ olderThanSeconds: 60, status: ["failed", "running"] }, /status/],
+    ])("rejects %p", async (options, message) => {
+        await expect(queue().pruneJobs(options as Parameters<PgQueue["pruneJobs"]>[0])).rejects.toThrow(message)
+    })
+})
+
+describe("retryJob", () => {
+    async function failedJob(config = {}){
+        const table = tableName()
+        const q = queue(table)
+        const publisher = new Publisher(q)
+        const { id } = await publisher.writeJob("x", { config, dedupeKey: "k" })
+        await admin.query(
+            `UPDATE ${table} SET status = 'failed', attempts = 5, last_error = 'boom',
+                 finished_at = now(), run_after = now() - interval '1 day' WHERE id = $1`,
+            [id],
+        )
+        return { q, table, publisher, id }
+    }
+
+    it("puts a failed job back to pending, due now, with its attempts reset", async () => {
+        const { q, id } = await failedJob()
+
+        const job = await q.retryJob(id)
+
+        expect(job).toMatchObject({ id, status: "pending", attempts: 0, finishedAt: null, lockedBy: null })
+        expect(job!.runAfter.getTime()).toBeGreaterThan(Date.now() - 60_000)
+        expect(await q.getJob(id)).toEqual(job)
+    })
+
+    it("keeps the last error for reference", async () => {
+        const { q, id } = await failedJob()
+
+        expect((await q.retryJob(id))!.lastError).toBe("boom")
+    })
+
+    it("gets picked up and run again by a subscriber", async () => {
+        const { q, id } = await failedJob()
+        await q.retryJob(id)
+
+        const claimed = await new Promise<number>((resolve) => {
+            const subscriber = new Subscriber(q, { pollIntervalSeconds: 0.02 })
+            void subscriber.listen("x", async (job) => {
+                await job.complete()
+                resolve(job.attempts)
+                void subscriber.stop()
+            })
+        })
+
+        expect(claimed).toBe(1)
+    })
+
+    it.each(["pending", "running", "succeeded"])("returns null and changes nothing for a %s job", async (status) => {
+        const { q, table, id } = await failedJob()
+        await admin.query(`UPDATE ${table} SET status = $2 WHERE id = $1`, [id, status])
+
+        expect(await q.retryJob(id)).toBeNull()
+        expect((await q.getJob(id))!.status).toBe(status)
+    })
+
+    it("returns null for an unknown id or one that isn't a uuid", async () => {
+        const q = queue()
+
+        expect(await q.retryJob("00000000-0000-0000-0000-000000000000")).toBeNull()
+        expect(await q.retryJob("nope")).toBeNull()
+    })
+
+    it("rejects when an unfinished job already holds its dedupeKey", async () => {
+        const { q, publisher, id } = await failedJob()
+        await publisher.writeJob("x", { dedupeKey: "k" })
+
+        await expect(q.retryJob(id)).rejects.toThrow(/dedupeKey/)
+        expect((await q.getJob(id))!.status).toBe("failed")
+    })
+})
+

@@ -40,7 +40,7 @@ export class Publisher{
         assertCount("delaySeconds", config.delaySeconds)
 
         await this.queue.init()
-        const table = this.queue.tableName
+        const table = this.queue.qualifiedTableName
         const values = [
             name, JSON.stringify(conditions.payload ?? {}), config.maxRetries, config.retryBackoffSeconds,
             config.lockTtlSeconds, config.delaySeconds, conditions.dedupeKey ?? null,

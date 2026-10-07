@@ -228,3 +228,18 @@ describe("writeJob", () => {
         })
     })
 })
+
+describe("a queue in its own schema", () => {
+    it("writes and dedupes jobs in the schema's table", async () => {
+        const schema = db.schemaName()
+        const table = db.tableName()
+        const publisher = new Publisher(db.track(new PgQueue(table, { connectionString: DATABASE_URL, schema })))
+
+        const first = await publisher.writeJob("report", { dedupeKey: "r_1" })
+        const second = await publisher.writeJob("report", { dedupeKey: "r_1" })
+
+        expect(second).toEqual({ id: first.id, deduped: true })
+        const { rows } = await db.admin.query(`SELECT id FROM ${schema}.${table}`)
+        expect(rows).toEqual([{ id: first.id }])
+    })
+})

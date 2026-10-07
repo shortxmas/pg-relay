@@ -16,6 +16,7 @@ export const DATABASE_URL = process.env.TEST_DB_URL
 export function useTestDb(){
     const admin = new Pool({ connectionString: DATABASE_URL })
     const tables: string[] = []
+    const schemas: string[] = []
     const queues: PgQueue[] = []
     const cleanups: (() => Promise<unknown>)[] = []
 
@@ -27,6 +28,7 @@ export function useTestDb(){
 
     afterAll(async () => {
         for(const table of tables) await admin.query(`DROP TABLE IF EXISTS ${table}`)
+        for(const schema of schemas) await admin.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`)
         await admin.end()
     })
 
@@ -37,6 +39,13 @@ export function useTestDb(){
         tableName(): string{
             const name = `t_${randomUUID().replaceAll("-", "").slice(0, 16)}`
             tables.push(name)
+            return name
+        },
+
+        /** A unique Postgres schema name, dropped with everything in it after the file's tests. */
+        schemaName(): string{
+            const name = `s_${randomUUID().replaceAll("-", "").slice(0, 16)}`
+            schemas.push(name)
             return name
         },
 

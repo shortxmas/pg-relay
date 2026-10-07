@@ -163,7 +163,12 @@ type JobListFilter = {
   name?: string
   status?: JobStatus | JobStatus[]   // e.g. ["pending", "running"]
   dedupeKey?: string
+  payload?: JobPayload               // payload contains these fields and values
+  payloadPath?: { path: string; vars?: Record<string, JsonValue> }  // JSON path condition
+  createdAfter?: Date                // written strictly after
+  createdBefore?: Date               // written strictly before
   limit?: number                     // default 100
+  offset?: number                    // default 0
 }
 ```
 
@@ -193,16 +198,114 @@ function describeJob(job: JobRecord): string {
 - `runAfter` comes from the database's clock, so "retrying in N seconds" is off by however far your server's clock drifts from it.
 - A `running` job whose worker died still shows `running` until its lock (`lockedUntil`) expires and another worker claims it.
 
+### Filtering on the payload
+
+`payload` matches jobs whose payload contains the given fields and values, nested objects included:
+
+```ts
+await queue.listJobs({ name: "export", payload: { report: { id: "r_123" } } })
+```
+
+`payloadPath` takes a [Postgres JSON path](https://www.postgresql.org/docs/current/functions-json.html#FUNCTIONS-SQLJSON-PATH) condition for anything else, such as ranges. Pass values as `vars` and refer to them as `$name`. They're sent as query parameters, never pasted into the SQL:
+
+```ts
+// unfinished summaries whose week starts in [from, to)
+await queue.listJobs({
+  name: "generate-summary",
+  status: ["pending", "running", "failed"],
+  payloadPath: {
+    path: "$.rangeStart >= $from && $.rangeStart < $to",
+    vars: { from: from.toISOString(), to: to.toISOString() },
+  },
+})
+```
+
+- ISO-8601 UTC timestamps written the same way (e.g. with `toISOString()`) compare correctly as strings.
+- A job whose payload lacks the path's fields doesn't match.
+- An invalid path rejects the call.
+
+### Paging
+
+`limit` and `offset` page through results, newest first. `createdAfter` and `createdBefore` take a job's own `createdAt`, so the last job of one page can be the cursor for the next:
+
+```ts
+const older = await queue.listJobs({ createdBefore: page.at(-1)!.createdAt, limit: 50 })
+```
+
+Times are compared to the millisecond, the precision of a JavaScript `Date`. Jobs written in the same millisecond as the cursor job are skipped. If that matters, page with `offset` instead.
+
+## Retrying and cleaning up
+
+```ts
+queue.retryJob(id: string): Promise<JobRecord | null>
+queue.pruneJobs(options: { olderThanSeconds: number; status?: "succeeded" | "failed" | ("succeeded" | "failed")[]; name?: string }): Promise<number>
+```
+
+`retryJob` sends a **failed** job back to `pending`, due now, with `attempts` reset to 0 so it gets its full retries again. Use it for a "retry" button.
+- It returns the updated job, or `null` if there's no failed job with that id. Pending, running and succeeded jobs are left alone.
+- `lastError` is kept so you can still see why the job failed.
+- It rejects if another unfinished job already holds the same name and `dedupeKey`.
+
+`pruneJobs` deletes `succeeded` and `failed` jobs that finished more than `olderThanSeconds` ago, and returns how many it deleted. Finished jobs otherwise stay in the table forever. `status` and `name` narrow it down. Pending and running jobs are never deleted. Run it on a schedule, for example from a cron or when the worker starts:
+
+```ts
+await queue.pruneJobs({ olderThanSeconds: 7 * 86_400, status: "succeeded" })   // keep failures longer
+await queue.pruneJobs({ olderThanSeconds: 30 * 86_400 })
+```
+
+## Writing safe handlers
+
+A job can run more than once:
+- when its worker dies after doing the work but before `complete()`
+- when its lock expires during a long pause, such as a stalled event loop, and another worker claims it
+- when `complete()` itself fails, for example because the database is unreachable
+
+So make handlers safe to repeat. The usual pattern is to key whatever the job produces by `job.id`, and to write it as an upsert before calling `complete()`:
+
+```ts
+await subscriber.listen("generate-summary", async (job) => {
+  const summary = await generate(job.payload, { signal: job.signal })
+
+  // A unique job_id column means a re-run overwrites its own result instead of adding a second one.
+  await db.query(
+    `INSERT INTO summaries (job_id, body) VALUES ($1, $2)
+     ON CONFLICT (job_id) DO UPDATE SET body = EXCLUDED.body`,
+    [job.id, summary],
+  )
+
+  await job.complete()
+})
+```
+
+- Write the result first, then call `complete()`. In the opposite order, a crash in between leaves a succeeded job with no result.
+- To find a job's result later (say, from a status page polling `getJob`), look it up by the job id.
+- For side effects outside your database, such as emails or payments, pass `job.id` as the provider's idempotency key where it supports one.
+
 ## Connecting
 
 ```ts
 new PgQueue("jobs")                                        // DATABASE_URL
 new PgQueue("jobs", { connectionString: "postgres://…" })  // explicit URL
 new PgQueue("jobs", { pool })                              // your own pg.Pool
+new PgQueue("jobs", { schema: "pg_relay" })                // table pg_relay.jobs
 ```
 
 - `queue.close()` ends the pool only if the queue opened it. A pool you pass in stays open.
 - The table name must be a lowercase Postgres identifier of at most 50 characters (`/^[a-z_][a-z0-9_]{0,49}$/`).
+
+### Keeping the table out of your ORM's way
+
+By default the table goes in the connection's current schema, usually `public`, next to your app's own tables. Tools that manage that schema, such as Prisma Migrate, may treat a table they didn't create as drift, and resetting the schema would drop your jobs.
+
+Give pg-relay its own schema instead:
+
+```ts
+const queue = new PgQueue("jobs", { schema: "pg_relay" })
+```
+
+- `init()` runs `CREATE SCHEMA IF NOT EXISTS pg_relay`, so the database user needs permission to create schemas, or the schema has to exist already.
+- Every query refers to `pg_relay.jobs` directly, whatever the connection's `search_path` is.
+- The schema name must be a lowercase Postgres identifier.
 
 ## The table
 

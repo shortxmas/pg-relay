@@ -30,8 +30,27 @@ export type JobListFilter = {
     name?: string
     status?: JobStatus | JobStatus[]
     dedupeKey?: string
+    // jobs whose payload contains these fields and values (Postgres jsonb @>)
+    payload?: JobPayload
+    // jobs whose payload matches a Postgres JSON path condition, e.g.
+    // { path: "$.rangeStart >= $from", vars: { from: "2026-10-05T00:00:00Z" } }
+    payloadPath?: { path: string; vars?: { [name: string]: JsonValue } }
+    // jobs written strictly after / strictly before this time
+    createdAfter?: Date
+    createdBefore?: Date
     // most jobs returned, newest first; defaults to 100
     limit?: number
+    // jobs to skip before the first one returned; defaults to 0
+    offset?: number
+}
+
+/** Which finished jobs pruneJobs deletes. */
+export type PruneJobsOptions = {
+    // delete jobs that finished more than this many seconds ago
+    olderThanSeconds: number
+    // defaults to both finished statuses
+    status?: "succeeded" | "failed" | ("succeeded" | "failed")[]
+    name?: string
 }
 
 /** A row of the queue's table. delaySeconds isn't stored: it only ever set the first runAfter. */
