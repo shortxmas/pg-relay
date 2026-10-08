@@ -17,6 +17,7 @@ npm run typecheck   # tsc --noEmit
 - **CI:** `.github/workflows/ci.yml` runs the typecheck, the tests and the build on every pull request and every push to `main`, against a throwaway `postgres:17` service container.
 - **Test-driven:** write the test first and watch it fail, then implement.
 - **Test layout:** one test file per source file. `queue.ts` has `queue.test.ts`. Shared database helpers live in `src/testing/db.ts`.
+- **Docs:** one reference file per published source file, in `docs/`. `src/queue.ts` has `docs/queue.md`, and `src/index.ts` has `docs/index.md`. They ship in the npm package, so update the matching doc in the same change as the code: every export, option, default, error and behaviour. `README.md` holds install, the quick start and guides, and links to the docs instead of repeating them.
 
 ## Releasing
 
