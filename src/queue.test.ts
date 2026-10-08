@@ -4,7 +4,7 @@ import { PgQueue, PgRelayInitError } from "./queue"
 import { Subscriber } from "./subscriber"
 import { DATABASE_URL, useTestDb } from "./testing/db"
 
-const { admin, tableName, schemaName, track } = useTestDb()
+const { admin, tableName, schemaName, track, defer } = useTestDb()
 
 /** A queue on DATABASE_URL, closed after each test. */
 function queue(table = tableName()): PgQueue{
@@ -580,6 +580,123 @@ describe("retryJob", () => {
     })
 })
 
+describe("stats", () => {
+    /** Writes a job named `name`, then sets its row's columns with `set` (SQL assignments), if given. */
+    async function job(q: PgQueue, table: string, name: string, set?: string){
+        const { id } = await new Publisher(q).writeJob(name)
+        if(set) await admin.query(`UPDATE ${table} SET ${set} WHERE id = $1`, [id])
+        return id
+    }
+    const zero = { pending: 0, due: 0, running: 0, succeeded: 0, failed: 0, oldestDueSeconds: null, expiredLocks: 0 }
+
+    it("returns nothing for an empty table, creating it if needed", async () => {
+        expect(await queue().stats()).toEqual([])
+    })
+
+    it("counts each job name's jobs by status, sorted by name", async () => {
+        const table = tableName()
+        const q = queue(table)
+        await job(q, table, "b")
+        await job(q, table, "b", "status = 'running', locked_until = now() + interval '1 minute'")
+        await job(q, table, "b", "status = 'succeeded', finished_at = now()")
+        await job(q, table, "b", "status = 'succeeded', finished_at = now()")
+        await job(q, table, "b", "status = 'failed', finished_at = now()")
+        await job(q, table, "a", "status = 'failed', finished_at = now()")
+
+        expect(await q.stats()).toEqual([
+            { ...zero, name: "a", failed: 1 },
+            { ...zero, name: "b", pending: 1, due: 1, running: 1, succeeded: 2, failed: 1, oldestDueSeconds: expect.any(Number) },
+        ])
+    })
+
+    it("counts a delayed job as pending but not due", async () => {
+        const q = queue()
+        await new Publisher(q).writeJob("x", { config: { delaySeconds: 60 } })
+
+        expect(await q.stats()).toEqual([{ ...zero, name: "x", pending: 1 }])
+    })
+
+    it("counts a job waiting out a retry backoff as pending but not due", async () => {
+        const table = tableName()
+        const q = queue(table)
+        await job(q, table, "x", "attempts = 1, last_error = 'boom', run_after = now() + interval '30 seconds'")
+
+        expect(await q.stats()).toEqual([{ ...zero, name: "x", pending: 1 }])
+    })
+
+    it("measures how long the oldest due job has waited from its run_after, not its creation", async () => {
+        const table = tableName()
+        const q = queue(table)
+        await job(q, table, "x", "created_at = now() - interval '1 day', run_after = now() - interval '10 seconds'")
+        await job(q, table, "x", "run_after = now() - interval '2 seconds'")
+        await job(q, table, "x", "created_at = now() - interval '2 days', run_after = now() + interval '1 hour'")
+
+        const [stats] = await q.stats()
+
+        expect(stats).toMatchObject({ pending: 3, due: 2 })
+        expect(stats.oldestDueSeconds).toBeGreaterThanOrEqual(10)
+        expect(stats.oldestDueSeconds).toBeLessThan(15)
+    })
+
+    it("counts running jobs whose lock has expired, not those with a live lock", async () => {
+        const table = tableName()
+        const q = queue(table)
+        await job(q, table, "x", "status = 'running', locked_until = now() - interval '1 second'")
+        await job(q, table, "x", "status = 'running', locked_until = now() + interval '1 minute'")
+
+        expect(await q.stats()).toEqual([{ ...zero, name: "x", running: 2, expiredLocks: 1 }])
+    })
+
+    it("narrows to one job name or several", async () => {
+        const table = tableName()
+        const q = queue(table)
+        for(const name of ["a", "b", "c"]) await job(q, table, name, "status = 'succeeded', finished_at = now()")
+        const names = async (filter: Parameters<PgQueue["stats"]>[0]) => (await q.stats(filter)).map((stats) => stats.name)
+
+        expect(await names({ name: "b" })).toEqual(["b"])
+        expect(await names({ name: ["c", "a"] })).toEqual(["a", "c"])
+        expect(await names({ name: "nope" })).toEqual([])
+        expect(await names({ name: [] })).toEqual([])
+    })
+
+    it("returns every count as a number", async () => {
+        const table = tableName()
+        const q = queue(table)
+        await job(q, table, "x")
+
+        const [stats] = await q.stats()
+
+        for(const key of ["pending", "due", "running", "succeeded", "failed", "oldestDueSeconds", "expiredLocks"] as const){
+            expect(typeof stats[key]).toBe("number")
+        }
+    })
+
+    it("neither blocks nor changes claims by a subscriber", async () => {
+        const q = queue()
+        const publisher = new Publisher(q)
+        for(let i = 0; i < 5; i++) await publisher.writeJob("x")
+
+        let release!: () => void
+        const held = new Promise<void>((resolve) => { release = resolve })
+        const subscriber = new Subscriber(q, { pollIntervalSeconds: 0.02 })
+        defer(async () => { release(); await subscriber.stop() })
+        const claimed: string[] = []
+        void subscriber.listen("x", async (claimedJob) => {
+            claimed.push(claimedJob.id)
+            await held
+            await claimedJob.complete()
+        }, { concurrency: 5 })
+        while(claimed.length < 5) await new Promise((resolve) => setTimeout(resolve, 10))
+
+        expect(await q.stats()).toEqual([{ ...zero, name: "x", running: 5 }])
+
+        release()
+        await subscriber.stop()
+        expect(new Set(claimed).size).toBe(5)
+        expect(await q.stats()).toEqual([{ ...zero, name: "x", succeeded: 5 }])
+    })
+})
+
 // Compile-time checks, enforced by `npm run typecheck`. The functions are never called, so nothing
 // touches the database; each test only asserts that the checks were defined.
 describe("job name types", () => {
@@ -597,9 +714,18 @@ describe("job name types", () => {
             const listed: Name = (await q.listJobs())[0].name
             const fetched: Name | undefined = (await q.getJob("id"))?.name
             const retried: Name | undefined = (await q.retryJob("id"))?.name
+            await q.stats({ name: "send-email" })
+            await q.stats({ name: ["send-email", "generate-summary"] })
+            // @ts-expect-error not one of the queue's job names
+            await q.stats({ name: "nope" })
+            // @ts-expect-error not one of the queue's job names
+            await q.stats({ name: ["send-email", "nope"] })
+            const counted: Name = (await q.stats())[0].name
+            // @ts-expect-error a stats row's name is one of the queue's names, not any string
+            const narrowStats: "send-email" = (await q.stats())[0].name
             // @ts-expect-error a record's name is one of the queue's names, not any string
             const narrow: "send-email" = (await q.listJobs())[0].name
-            return [listed, fetched, retried, narrow]
+            return [listed, fetched, retried, narrow, counted, narrowStats]
         }
         expect(checks).toBeInstanceOf(Function)
     })

@@ -1,5 +1,5 @@
 import { Pool } from "pg"
-import type { JobListFilter, JobPayload, JobRecord, JobStatus, PruneJobsOptions } from "./job"
+import type { JobListFilter, JobNameStats, JobPayload, JobRecord, JobStatsFilter, JobStatus, PruneJobsOptions } from "./job"
 
 export type PgQueueOptions = {
     // defaults to process.env.DATABASE_URL, read when the queue first connects
@@ -161,6 +161,33 @@ export class PgQueue<TName extends string = string>{
             [statuses, options.olderThanSeconds, options.name ?? null],
         )
         return rowCount ?? 0
+    }
+
+    /**
+     * Per job name: how many jobs are in each status, how many pending jobs are due, how long the oldest
+     * due job has waited since its run_after, and how many running jobs have an expired lock. Only names
+     * with rows are returned, sorted by name. Read only, in one query. Creates the table first if needed.
+     */
+    async stats(filter: JobStatsFilter<TName> = {}): Promise<JobNameStats<TName>[]>{
+        await this.init()
+        const names = filter.name === undefined ? null : ([] as string[]).concat(filter.name)
+        const { rows } = await this.pool.query<JobNameStats<TName>>(
+            `SELECT name,
+                    count(*) FILTER (WHERE status = 'pending')::int AS pending,
+                    count(*) FILTER (WHERE status = 'pending' AND run_after <= now())::int AS due,
+                    count(*) FILTER (WHERE status = 'running')::int AS running,
+                    count(*) FILTER (WHERE status = 'succeeded')::int AS succeeded,
+                    count(*) FILTER (WHERE status = 'failed')::int AS failed,
+                    EXTRACT(EPOCH FROM now() - min(run_after) FILTER (WHERE status = 'pending' AND run_after <= now()))::float8
+                        AS "oldestDueSeconds",
+                    count(*) FILTER (WHERE status = 'running' AND locked_until < now())::int AS "expiredLocks"
+             FROM ${this.qualifiedTableName}
+             WHERE $1::text[] IS NULL OR name = ANY($1)
+             GROUP BY name
+             ORDER BY name`,
+            [names],
+        )
+        return rows
     }
 
     /**

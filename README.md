@@ -92,7 +92,7 @@ export const subscriber = new Subscriber(queue)  // inferred: Subscriber<JobName
 ```
 
 - `writeJob` and `listen` only accept those names, so `publisher.writeJob("send-emial")` is a compile error.
-- The `name` filters of `listJobs` and `pruneJobs` are checked the same way, and the `name` of every returned `JobRecord` is typed as `JobName`.
+- The `name` filters of `listJobs`, `pruneJobs` and `stats` are checked the same way, and the `name` of every returned `JobRecord` and `JobNameStats` is typed as `JobName`.
 - Inside `listen("send-email", (job) => …)`, `job.name` is typed as `"send-email"`.
 - Without the type argument, any string works.
 
@@ -276,6 +276,66 @@ await queue.pruneJobs({ olderThanSeconds: 7 * 86_400, status: "succeeded" })   /
 await queue.pruneJobs({ olderThanSeconds: 30 * 86_400 })
 ```
 
+## Monitoring the queue
+
+Once jobs run in a separate worker, the questions in production are "is the queue keeping up?" and "is anything stuck?". `stats()` answers both in one read-only query, per job name. The app and the worker can both call it:
+
+```ts
+queue.stats(filter?: { name?: string | string[] }): Promise<JobNameStats[]>
+
+type JobNameStats = {
+  name: string
+  pending: number                   // status = 'pending', due or not
+  due: number                       // pending with run_after <= now(): what a worker would claim right now
+  running: number
+  succeeded: number
+  failed: number
+  oldestDueSeconds: number | null   // how long the oldest due job has waited; null when none are due
+  expiredLocks: number              // running jobs whose worker stopped renewing their lock
+}
+```
+
+```ts
+await queue.stats()
+// [
+//   { name: "generate-report", pending: 1, due: 0, running: 0, succeeded: 88,   failed: 0,
+//     oldestDueSeconds: null, expiredLocks: 0 },
+//   { name: "send-email",      pending: 3, due: 3, running: 1, succeeded: 4120, failed: 2,
+//     oldestDueSeconds: 41.7, expiredLocks: 0 },
+// ]
+```
+
+What to watch:
+- **Queue age** (`oldestDueSeconds`) is the main alerting signal. If it keeps growing, workers are down, stuck or too few, whatever the backlog's size.
+- **Backlog** (`due`): jobs a worker could claim right now. `pending` also counts jobs scheduled for later, so a queue holding a thousand jobs for tomorrow is healthy.
+- **Failures** (`failed`): alert when it goes up.
+- **Dead workers** (`expiredLocks`): running jobs whose lock expired without being renewed. Another worker will claim them again.
+
+Age is measured from a job's `run_after`, not its `created_at`. A job written with `delaySeconds`, or waiting out a retry backoff, isn't late until its `run_after` passes. Measuring from `created_at` would make every retry look like a stuck queue. All times come from the database's `now()`, so clock drift between processes doesn't matter.
+
+For example, a health check and a Prometheus gauge:
+
+```ts
+app.get("/health/queue", async (_req, res) => {
+  const stuck = (await queue.stats()).filter((s) => (s.oldestDueSeconds ?? 0) > 300 || s.expiredLocks > 0)
+  res.status(stuck.length > 0 ? 503 : 200).json({ stuck })
+})
+
+// prom-client
+new Gauge({
+  name: "jobs_oldest_due_seconds",
+  help: "Seconds the oldest due job has waited",
+  labelNames: ["name"],
+  async collect(){
+    for(const s of await queue.stats()) this.set({ name: s.name }, s.oldestDueSeconds ?? 0)
+  },
+})
+```
+
+- **Only names with jobs are returned**, sorted by name. pg-relay has no list of job names, so a name that was never written, or whose jobs were all pruned, is missing rather than all zeros. If you have a list of names, fill in zeros yourself.
+- **Cost:** `stats()` is meant to be polled, every 15–60 seconds for a metrics scrape. `succeeded` and `failed` count every finished job still in the table, so its cost grows with unpruned rows. Run [`pruneJobs`](#retrying-and-cleaning-up) on a schedule.
+- It takes no locks and never blocks claiming. Like `getJob` and `listJobs`, it creates the table first if needed, and returns `[]` on an empty one.
+
 ## Writing safe handlers
 
 A job can run more than once:
@@ -332,7 +392,7 @@ const queue = new PgQueue("jobs", { schema: "relay" })
 
 ## The table
 
-The table is created by `queue.init()`. You rarely need to call `init()` yourself, because the first `writeJob`, `listen`, `getJob` or `listJobs` calls it.
+The table is created by `queue.init()`. You rarely need to call `init()` yourself, because the first `writeJob`, `listen`, `getJob`, `listJobs` or `stats` calls it.
 
 - Init runs inside a transaction holding a Postgres advisory lock, so the app and the worker can both start at once without colliding.
 - It creates the table and indexes if they're missing and leaves existing rows alone.
