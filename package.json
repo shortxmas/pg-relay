@@ -1,6 +1,6 @@
 {
   "name": "pg-relay",
-  "version": "0.4.2",
+  "version": "0.5.0",
   "description": "Postgres-backed job queue: write jobs from your app, run them in a worker",
   "keywords": [
     "postgres",
