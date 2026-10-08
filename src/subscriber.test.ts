@@ -1,6 +1,6 @@
 import { Publisher } from "./publisher"
 import { PgQueue, PgRelayInitError } from "./queue"
-import { type ClaimedJob, LockLostError, retryDelaySeconds, Subscriber, type SubscriberConfig } from "./subscriber"
+import { type ClaimedJob, type FailedJob, LockLostError, retryDelaySeconds, Subscriber, type SubscriberConfig } from "./subscriber"
 import { DATABASE_URL, useTestDb } from "./testing/db"
 
 const db = useTestDb()
@@ -501,6 +501,204 @@ describe("stop", () => {
     })
 })
 
+describe("onFailed", () => {
+    /** A hook that records every job it's called with. */
+    function recorder(){
+        const calls: FailedJob[] = []
+        const onFailed = jest.fn((job: FailedJob) => { calls.push(job) })
+        return { calls, onFailed }
+    }
+
+    it("fires once with the job and the original error on fail(err, { retry: false })", async () => {
+        const { publisher, subscriber, row } = setup()
+        const { id } = await publisher.writeJob("x", { payload: { reportId: "r_1" }, config: { maxRetries: 3 } })
+        const { calls, onFailed } = recorder()
+        const error = new Error("bad input")
+
+        await subscriber().listen("x", (job) => job.fail(error, { retry: false }).then(() => {}), { onFailed })
+
+        await waitFor(() => calls.length)
+        await sleep(100)
+        expect(onFailed).toHaveBeenCalledTimes(1)
+        expect(calls[0]).toEqual({
+            id, name: "x", payload: { reportId: "r_1" }, attempts: 1, maxRetries: 3, lastError: "bad input", error,
+        })
+        expect((await row(id)).status).toBe("failed")
+    })
+
+    it("fires on fail(err) with no retries left, not while retries are left", async () => {
+        const { publisher, subscriber, row } = setup()
+        const { id } = await publisher.writeJob("x", { config: { maxRetries: 1, retryBackoffSeconds: 60 } })
+        const { onFailed } = recorder()
+
+        await subscriber().listen("x", (job) => job.fail(new Error("broken")).then(() => {}), { onFailed })
+
+        await waitFor(async () => (await row(id)).last_error)
+        await sleep(100)
+        expect(await row(id)).toMatchObject({ status: "pending" })
+        expect(onFailed).not.toHaveBeenCalled()
+    })
+
+    it("fires on fail(err) on the last attempt", async () => {
+        const { publisher, subscriber } = setup()
+        await publisher.writeJob("x", { config: { maxRetries: 1, retryBackoffSeconds: 0 } })
+        const { calls, onFailed } = recorder()
+
+        await subscriber().listen("x", (job) => job.fail(new Error("broken")).then(() => {}), { onFailed })
+
+        await waitFor(() => calls.length)
+        expect(calls[0]).toMatchObject({ attempts: 2, maxRetries: 1, lastError: "broken" })
+    })
+
+    it("fires with the thrown error when the handler throws on its last attempt", async () => {
+        const { publisher, subscriber } = setup()
+        await publisher.writeJob("x", { config: { maxRetries: 0 } })
+        const { calls, onFailed } = recorder()
+        const error = new Error("kaput")
+
+        await subscriber().listen("x", async () => { throw error }, { onFailed })
+
+        await waitFor(() => calls.length)
+        expect(calls[0]).toMatchObject({ lastError: "kaput", error })
+    })
+
+    it("fires when the handler returns without finishing on its last attempt", async () => {
+        const { publisher, subscriber } = setup()
+        await publisher.writeJob("x", { config: { maxRetries: 0 } })
+        const { calls, onFailed } = recorder()
+
+        await subscriber().listen("x", async () => {}, { onFailed })
+
+        await waitFor(() => calls.length)
+        expect(calls[0].lastError).toMatch(/without calling complete or fail/)
+        expect((calls[0].error as Error).message).toMatch(/without calling complete or fail/)
+    })
+
+    it("fires without an error, and without running the handler, when the final attempt was already started", async () => {
+        const { table, queue, subscriber, row } = setup()
+        await queue.init()
+        const { rows: [{ id }] } = await db.admin.query(
+            `INSERT INTO ${table} (name, payload, status, attempts, max_retries, retry_backoff_seconds, lock_ttl_seconds, locked_by, locked_until)
+             VALUES ('x', '{"reportId":"r_1"}', 'running', 1, 0, 30, 60, 'dead-worker', now() - interval '1 second')
+             RETURNING id`,
+        )
+        const handler = jest.fn()
+        const { calls, onFailed } = recorder()
+
+        await subscriber().listen("x", handler, { onFailed })
+
+        await waitFor(() => calls.length)
+        expect(handler).not.toHaveBeenCalled()
+        expect((await row(id)).status).toBe("failed")
+        expect(calls[0]).toEqual({
+            id, name: "x", payload: { reportId: "r_1" }, attempts: 2, maxRetries: 0, lastError: "worker stopped during the final attempt",
+        })
+        expect(calls[0]).not.toHaveProperty("error")
+    })
+
+    it("doesn't fire when the lock was lost and the failure was dropped", async () => {
+        const { table, publisher, subscriber } = setup()
+        await publisher.writeJob("x")
+        const { onFailed } = recorder()
+        let failed: boolean | undefined
+
+        await subscriber().listen("x", async (job) => {
+            await db.admin.query(`UPDATE ${table} SET locked_by = 'another-worker' WHERE id = $1`, [job.id])
+            failed = await job.fail(new Error("bad input"), { retry: false })
+        }, { onFailed })
+
+        await waitFor(() => failed !== undefined)
+        await sleep(100)
+        expect(failed).toBe(false)
+        expect(onFailed).not.toHaveBeenCalled()
+    })
+
+    it("doesn't fire on complete()", async () => {
+        const { publisher, subscriber, row } = setup()
+        const { id } = await publisher.writeJob("x")
+        const { onFailed } = recorder()
+
+        await subscriber().listen("x", (job) => job.complete().then(() => {}), { onFailed })
+
+        await waitFor(async () => (await row(id)).status === "succeeded")
+        await sleep(100)
+        expect(onFailed).not.toHaveBeenCalled()
+    })
+
+    it("runs only after the handler has returned", async () => {
+        const { publisher, subscriber } = setup()
+        await publisher.writeJob("x", { config: { maxRetries: 0 } })
+        const events: string[] = []
+
+        await subscriber().listen("x", async (job) => {
+            await job.fail(new Error("boom"), { retry: false })
+            events.push("failed")
+            await sleep(100)
+            events.push("handler returned")
+        }, { onFailed: () => { events.push("hook") } })
+
+        await waitFor(() => events.includes("hook"))
+        expect(events).toEqual(["failed", "handler returned", "hook"])
+    })
+
+    it("logs a hook's error, keeps the job failed and keeps claiming", async () => {
+        const { publisher, subscriber, row } = setup()
+        const first = await publisher.writeJob("x", { config: { maxRetries: 0 } })
+        const second = await publisher.writeJob("x", { config: { maxRetries: 0 } })
+        const logger = { warn: jest.fn(), error: jest.fn() }
+        const onFailed = jest.fn(async () => { throw new Error("hook broke") })
+
+        await subscriber({ logger }).listen("x", (job) => job.fail(new Error("boom"), { retry: false }).then(() => {}), { onFailed })
+
+        await waitFor(() => onFailed.mock.calls.length === 2)
+        expect((await row(first.id)).status).toBe("failed")
+        expect((await row(second.id)).status).toBe("failed")
+        expect(logger.error).toHaveBeenCalledWith(expect.stringMatching(/onFailed/), expect.objectContaining({ message: "hook broke" }))
+    })
+
+    it("holds the slot until the hook settles: the next claim waits, and so does stop()", async () => {
+        const { publisher, subscriber, row } = setup()
+        await publisher.writeJob("x", { config: { maxRetries: 0 } })
+        const next = await publisher.writeJob("x", { config: { maxRetries: 0 } })
+        const hook = gate()
+        let hooked = 0
+        const s = subscriber()
+
+        await s.listen("x", (job) => job.fail(new Error("boom"), { retry: false }).then(() => {}), {
+            concurrency: 1,
+            onFailed: async () => {
+                hooked++
+                await hook.opened
+            },
+        })
+        await waitFor(() => hooked === 1)
+        await sleep(200)
+        expect((await row(next.id)).status).toBe("pending")
+
+        let stopped = false
+        const stopping = s.stop().then(() => (stopped = true))
+        await sleep(100)
+        expect(stopped).toBe(false)
+
+        hook.open()
+        await stopping
+        expect(hooked).toBe(1)
+    })
+
+    it("fires again when a retried job fails again", async () => {
+        const { queue, publisher, subscriber } = setup()
+        const { id } = await publisher.writeJob("x", { config: { maxRetries: 0 } })
+        const { calls, onFailed } = recorder()
+
+        await subscriber().listen("x", (job) => job.fail(new Error("boom")).then(() => {}), { onFailed })
+        await waitFor(() => calls.length === 1)
+        await queue.retryJob(id)
+
+        await waitFor(() => calls.length === 2)
+        expect(calls.map((job) => job.id)).toEqual([id, id])
+    })
+})
+
 describe("a queue in its own schema", () => {
     it("claims, retries, renews and finishes jobs in the schema's table", async () => {
         const schema = db.schemaName()
@@ -532,6 +730,16 @@ describe("job name types", () => {
             })
             // @ts-expect-error not one of the queue's job names
             await subscriber.listen("send-emial", async () => {})
+
+            await subscriber.listen<{ reportId: string }, "generate-summary">("generate-summary", async () => {}, {
+                onFailed: (job) => {
+                    const name: "generate-summary" = job.name
+                    const reportId: string = job.payload.reportId
+                    // @ts-expect-error the payload type follows listen's
+                    const missing: string = job.payload.nope
+                    return [name, reportId, missing]
+                },
+            })
         }
         expect(checks).toBeInstanceOf(Function)
     })

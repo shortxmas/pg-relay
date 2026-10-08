@@ -93,7 +93,7 @@ export const subscriber = new Subscriber(queue)  // inferred: Subscriber<JobName
 
 - `writeJob` and `listen` only accept those names, so `publisher.writeJob("send-emial")` is a compile error.
 - The `name` filters of `listJobs`, `pruneJobs` and `stats` are checked the same way, and the `name` of every returned `JobRecord` and `JobNameStats` is typed as `JobName`.
-- Inside `listen("send-email", (job) => …)`, `job.name` is typed as `"send-email"`.
+- Inside `listen("send-email", (job) => …)` and its `onFailed` hook, `job.name` is typed as `"send-email"`.
 - Without the type argument, any string works.
 
 ## Writing jobs
@@ -127,7 +127,7 @@ While a job with the same name and `dedupeKey` is pending or running, `writeJob`
 
 ```ts
 new Subscriber(queue, config?: SubscriberConfig)
-subscriber.listen(name: string, handler: (job: ClaimedJob) => unknown, config?: ListenConfig): Promise<void>
+subscriber.listen(name: string, handler: (job: ClaimedJob) => unknown, config?: ListenConfig & { onFailed?: (job: FailedJob) => unknown }): Promise<void>
 subscriber.stop(): Promise<void>
 ```
 
@@ -136,6 +136,7 @@ subscriber.stop(): Promise<void>
 | `concurrency` | `1` | Jobs of one name this subscriber runs at once. |
 | `pollIntervalSeconds` | `5` | Wait after a poll finds nothing before polling again. After a claimed job, it polls again immediately. |
 | `logger` | `console` | Subscriber-wide only. Receives `warn` and `error` calls. |
+| `onFailed` | none | Per `listen` only. Called when a job of that name fails for good; see [When a job fails for good](#when-a-job-fails-for-good). |
 
 Config passed to the `Subscriber` applies to every `listen`. Config passed to one `listen` overrides it for that job name. Each `listen` has its own slots, so a slow job name can't starve the others. Listening for the same name twice on one subscriber throws.
 
@@ -173,6 +174,45 @@ Every job has to be finished with exactly one call to `complete` or `fail`:
 - An attempt is counted when a job is claimed, so a job that crashes its worker still uses up its retries.
 - When a worker dies, its job's lock expires and the job is claimed again by the normal poll. There's no separate sweep.
 - If the attempt that died was the job's last, the job is marked `failed` ("worker stopped during the final attempt") instead of running again.
+
+### When a job fails for good
+
+Most jobs have a record in the app that shows their progress: a report that's "generating", an export that's "in progress". When the job fails for good, that record has to move to a failed state, or the UI waits forever. The handler can't always do this itself: when the worker dies during the job's last attempt, no handler code runs. Pass `onFailed` to `listen` to hear about every failure:
+
+```ts
+await subscriber.listen("generate-report", handler, {
+  onFailed: async (job) => {
+    if(typeof job.payload.reportId !== "string") return
+    await db.query(`UPDATE reports SET status = 'failed' WHERE id = $1`, [job.payload.reportId])
+  },
+})
+
+type FailedJob = {
+  id: string
+  name: string
+  payload: JobPayload   // as stored, not validated
+  attempts: number
+  maxRetries: number
+  lastError: string     // what was stored in last_error
+  error?: unknown       // the original error; absent when the worker died during the final attempt
+}
+```
+
+It's called every time pg-relay moves a job of that name to `failed`:
+- the handler calls `fail(error, { retry: false })`
+- the handler calls `fail(error)` with no retries left
+- the handler throws, or returns without finishing the job, with no retries left
+- a claim finds a job whose final attempt was already started by a worker that died. The handler isn't called, and `error` is absent.
+
+How it runs:
+- Only when the `failed` write landed. If this worker lost the lock, nothing is written and the hook isn't called. Never for `succeeded`, or for a retry back to `pending`.
+- After the handler has returned or thrown, never at the same time as it.
+- In the job's slot: the slot doesn't claim its next job until the hook settles, and `stop()` waits for it.
+- If it throws, the error goes to `logger.error` and the job stays `failed`. It isn't retried, so make its writes safe to repeat.
+- Once per failure: if `queue.retryJob` resets the job and it fails again, the hook is called again.
+- The payload is passed as stored. A malformed payload may be why the job failed, so check it before using it.
+
+The hook is **best effort**. It runs after the `failed` write commits, so a worker that dies in the milliseconds between the two never calls it. If you need certainty, also run a reconciliation sweep that reads `queue.listJobs({ name, status: "failed" })` on a schedule and updates any records still marked in progress.
 
 ## Checking on jobs
 

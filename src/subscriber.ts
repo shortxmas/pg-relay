@@ -50,6 +50,23 @@ export type ClaimedJob<TPayload extends JobPayload = JobPayload, TName extends s
 export type JobHandler<TPayload extends JobPayload = JobPayload, TName extends string = string> =
     (job: ClaimedJob<TPayload, TName>) => unknown
 
+/** A job pg-relay just moved to failed, handed to listen's onFailed hook. */
+export type FailedJob<TPayload extends JobPayload = JobPayload, TName extends string = string> = {
+    id: string
+    name: TName
+    // as stored: it isn't validated, and a malformed payload may be why the job failed
+    payload: TPayload
+    attempts: number
+    maxRetries: number
+    // what was stored in last_error: the error's message, truncated
+    lastError: string
+    // the original error; absent when the worker died during the final attempt and no handler ran
+    error?: unknown
+}
+
+export type FailedHook<TPayload extends JobPayload = JobPayload, TName extends string = string> =
+    (job: FailedJob<TPayload, TName>) => unknown
+
 /** This worker no longer holds the job's lock: it expired and another worker claimed the job. */
 export class LockLostError extends Error{
     constructor(jobId: string){
@@ -100,12 +117,16 @@ export class Subscriber<TName extends string = string>{
     async listen<TPayload extends JobPayload = JobPayload, N extends TName = TName>(
         name: N,
         handler: JobHandler<TPayload, N>,
-        config: ListenConfig = {},
+        config: ListenConfig & {
+            // called after each job of this name moves to failed, once its handler has settled
+            onFailed?: FailedHook<TPayload, N>
+        } = {},
     ): Promise<void>{
         if(!name) throw new Error("pg-relay: listen needs a job name")
         if(this.stopping.signal.aborted) throw new Error("pg-relay: this subscriber was stopped")
         if(this.listening.has(name)) throw new Error(`pg-relay: already listening for "${name}"`)
-        const { concurrency, pollIntervalSeconds } = resolveListenConfig(this.config, config)
+        const { onFailed, ...listenConfig } = config
+        const { concurrency, pollIntervalSeconds } = resolveListenConfig(this.config, listenConfig)
 
         this.listening.add(name)
         try{
@@ -116,7 +137,7 @@ export class Subscriber<TName extends string = string>{
         }
 
         for(let i = 0; i < concurrency; i++){
-            this.loops.push(this.pollLoop(name, handler as unknown as JobHandler, pollIntervalSeconds * 1000))
+            this.loops.push(this.pollLoop(name, handler as unknown as JobHandler, onFailed as FailedHook | undefined, pollIntervalSeconds * 1000))
         }
     }
 
@@ -127,12 +148,12 @@ export class Subscriber<TName extends string = string>{
     }
 
     /** Polls until stopped: straight away after a claimed job, otherwise after `intervalMs`. */
-    private async pollLoop(name: string, handler: JobHandler, intervalMs: number): Promise<void>{
+    private async pollLoop(name: string, handler: JobHandler, onFailed: FailedHook | undefined, intervalMs: number): Promise<void>{
         const signal = this.stopping.signal
         while(!signal.aborted){
             let claimed = false
             try{
-                claimed = await this.processNext(name, handler)
+                claimed = await this.processNext(name, handler, onFailed)
             }catch(error){
                 this.logger.error(`pg-relay: processing "${name}" failed:`, error)
             }
@@ -141,7 +162,7 @@ export class Subscriber<TName extends string = string>{
     }
 
     /** Claims the next due job called `name` and runs it. false when there was nothing to claim. */
-    private async processNext(name: string, handler: JobHandler): Promise<boolean>{
+    private async processNext(name: string, handler: JobHandler, onFailed?: FailedHook): Promise<boolean>{
         // A fresh token per claim, so acks can only land while this claim still holds the job.
         const lockedBy = `${hostname()}:${process.pid}:${randomUUID().slice(0, 8)}`
         const table = this.queue.qualifiedTableName
@@ -169,17 +190,21 @@ export class Subscriber<TName extends string = string>{
 
         // Its last allowed attempt was already started by a worker that died; don't run it again.
         if(row.attempts > row.max_retries + 1){
-            await this.release(row.id, lockedBy, { status: "failed", error: FINAL_ATTEMPT })
+            if(await this.release(row.id, lockedBy, { status: "failed", error: FINAL_ATTEMPT })){
+                await this.notifyFailed(onFailed, failedJob(row, FINAL_ATTEMPT))
+            }
             return true
         }
 
-        await this.run(row, lockedBy, handler)
+        await this.run(row, lockedBy, handler, onFailed)
         return true
     }
 
-    private async run(row: ClaimedRow, lockedBy: string, handler: JobHandler): Promise<void>{
+    private async run(row: ClaimedRow, lockedBy: string, handler: JobHandler, onFailed?: FailedHook): Promise<void>{
         const lock = new AbortController()
         let acked = false
+        // set when this run's failed write lands; onFailed gets it once the handler has settled
+        let failed: FailedJob | undefined
 
         const heartbeat = setInterval(() => {
             this.renewLock(row.id, lockedBy).then((held) => {
@@ -201,11 +226,13 @@ export class Subscriber<TName extends string = string>{
             return held
         }
 
-        const fail = (error: unknown, options: FailOptions = {}) => ack(() => {
+        const fail = (error: unknown, options: FailOptions = {}) => ack(async () => {
             const retry = options.retry !== false && row.attempts <= row.max_retries
-            return this.release(row.id, lockedBy, retry
+            const held = await this.release(row.id, lockedBy, retry
                 ? { status: "pending", error: error, delaySeconds: retryDelaySeconds(row.retry_backoff_seconds, row.attempts) }
                 : { status: "failed", error: error })
+            if(held && !retry) failed = { ...failedJob(row, errorMessage(error)), error }
+            return held
         })
 
         const job: ClaimedJob = {
@@ -227,6 +254,17 @@ export class Subscriber<TName extends string = string>{
             else await fail(error)
         }finally{
             clearInterval(heartbeat)
+        }
+        if(failed) await this.notifyFailed(onFailed, failed)
+    }
+
+    /** Runs the onFailed hook, if any; its errors are logged, never thrown. */
+    private async notifyFailed(onFailed: FailedHook | undefined, job: FailedJob): Promise<void>{
+        if(!onFailed) return
+        try{
+            await onFailed(job)
+        }catch(error){
+            this.logger.error(`pg-relay: onFailed for job ${job.id} threw:`, error)
         }
     }
 
@@ -272,6 +310,10 @@ export class Subscriber<TName extends string = string>{
         )
         return rowCount === 1
     }
+}
+
+function failedJob(row: ClaimedRow, lastError: string): FailedJob{
+    return { id: row.id, name: row.name, payload: row.payload, attempts: row.attempts, maxRetries: row.max_retries, lastError }
 }
 
 function resolveListenConfig(defaults: Required<ListenConfig>, config: ListenConfig): Required<ListenConfig>{
