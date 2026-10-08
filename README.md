@@ -52,7 +52,7 @@ const { id, deduped } = await publisher.writeJob("geminiAiWorkflow", {
 
 No job names are registered ahead of time. A job is whatever name the publisher writes and the subscriber listens for.
 
-Writing a job inside your own database transaction, so it rolls back with your other writes, is up to each app. `writeJob` always uses the queue's own connection.
+To write a job inside your own database transaction, so it commits or rolls back with your other writes, pass `{ tx }`: see [Writing jobs in your own transaction](#writing-jobs-in-your-own-transaction).
 
 ### Listening for jobs (worker)
 
@@ -99,7 +99,7 @@ export const subscriber = new Subscriber(queue)  // inferred: Subscriber<JobName
 ## Writing jobs
 
 ```ts
-publisher.writeJob(name: string, conditions?: JobConditions): Promise<{ id: string; deduped: boolean }>
+publisher.writeJob(name: string, conditions?: JobConditions, options?: { tx?: TransactionClient }): Promise<{ id: string; deduped: boolean }>
 
 type JobConditions = {
   payload?: JobPayload  // JSON object for the worker; defaults to {}
@@ -122,6 +122,46 @@ The defaults are exported as `DEFAULT_JOB_CONFIG`. A job's config is stored on i
 ### Deduplication
 
 While a job with the same name and `dedupeKey` is pending or running, `writeJob` writes nothing and returns that job's id with `deduped: true`. Once it succeeds or fails, the key is free again. Keys are scoped to the job name, and a unique index enforces them, so concurrent writes still produce one job.
+
+### Writing jobs in your own transaction
+
+Most jobs exist because something else in the database just changed: a review was approved, so email the customer. The job and the change have to land together. Written on separate connections, either order can go wrong:
+- **Job first, then the app's transaction commits.** If the app's transaction rolls back, the job has already been written, and the worker emails the customer about an approval that never happened.
+- **App's transaction commits, then the job.** If the process dies or the pool times out in between, the job is lost. Retrying the request usually doesn't help either, because the triggering write is guarded to happen once (`WHERE approved_at IS NULL`).
+
+Pass the transaction you already have as `tx`, and the job commits or rolls back with your other writes. It accepts a node-postgres client with a transaction open on it:
+
+```ts
+const client = await pool.connect()
+try {
+  await client.query("BEGIN")
+  await client.query("UPDATE reviews SET status = 'approved' WHERE id = $1", [id])
+  await publisher.writeJob("send-email", { payload: { reviewId: id } }, { tx: client })
+  await client.query("COMMIT")
+} catch (error) {
+  await client.query("ROLLBACK")
+  throw error
+} finally {
+  client.release()
+}
+```
+
+or the `tx` of a Prisma interactive transaction:
+
+```ts
+await prisma.$transaction(async (tx) => {
+  await tx.review.update({ where: { id }, data: { status: "approved" } })
+  await publisher.writeJob("send-email", { payload: { reviewId: id } }, { tx })
+})
+```
+
+- The worker can't claim the job until you commit. If you roll back, the job never existed.
+- Dedupe works inside the transaction: writing the same name and `dedupeKey` twice returns the first job with `deduped: true`. A duplicate is never an error, so it doesn't abort your transaction.
+- If another open transaction has written the same key, `writeJob` waits for it. If that transaction commits, you get its job back with `deduped: true`. If it rolls back, your job is written.
+- **Isolation level:** under `REPEATABLE READ` or `SERIALIZABLE`, a duplicate key committed by another transaction after yours started raises a serialization failure (`40001`). Retry the transaction, as for any other `40001`. The default, `READ COMMITTED`, never does this.
+- **Same database:** the connection must be on the queue's database. pg-relay can't check this.
+- The queue still needs its own connection (`DATABASE_URL`, `connectionString` or `pool`): it creates the table there on first use, outside your transaction. The worker and `getJob`/`listJobs` need that connection anyway.
+- `tx` must be a single connection. A `pg.Pool` is rejected with a `TypeError`, because each of its queries may run on a different connection, outside your transaction. Prisma's array form, `$transaction([a, b])`, can't run pg-relay's SQL and isn't supported.
 
 ## Listening for jobs
 
