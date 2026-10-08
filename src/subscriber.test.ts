@@ -1,6 +1,8 @@
 import { Publisher } from "./publisher"
 import { PgQueue, PgRelayInitError } from "./queue"
-import { type ClaimedJob, type FailedJob, LockLostError, retryDelaySeconds, Subscriber, type SubscriberConfig } from "./subscriber"
+import {
+    type ClaimedJob, type FailedJob, LockLostError, retryDelaySeconds, Subscriber, type SubscriberConfig, SubscriberStoppedError,
+} from "./subscriber"
 import { DATABASE_URL, useTestDb } from "./testing/db"
 
 const db = useTestDb()
@@ -459,26 +461,29 @@ describe("concurrency", () => {
 })
 
 describe("stop", () => {
-    it("waits for running handlers, then claims nothing more", async () => {
+    it("with abort: false, waits for running handlers without aborting them, then claims nothing more", async () => {
         const { publisher, subscriber, row } = setup()
         const first = await publisher.writeJob("x")
         const release = gate()
         let started = false
+        let aborted: boolean | undefined
         const s = subscriber()
         await s.listen("x", async (job) => {
             started = true
             await release.opened
+            aborted = job.signal.aborted
             await job.complete()
         })
         await waitFor(() => started)
 
         let stopped = false
-        const stopping = s.stop().then(() => (stopped = true))
+        const stopping = s.stop({ abort: false }).then(() => (stopped = true))
         await sleep(100)
         expect(stopped).toBe(false)
 
         release.open()
         await stopping
+        expect(aborted).toBe(false)
         expect((await row(first.id)).status).toBe("succeeded")
 
         const second = await publisher.writeJob("x")
@@ -498,6 +503,186 @@ describe("stop", () => {
         const { subscriber } = setup()
 
         await expect(subscriber().stop()).resolves.toBeUndefined()
+    })
+})
+
+describe("stop aborting running jobs", () => {
+    const aborted = (job: ClaimedJob) => new Promise<void>((resolve) => {
+        if(job.signal.aborted) return resolve()
+        job.signal.addEventListener("abort", () => resolve(), { once: true })
+    })
+
+    /**
+     * Starts a job whose handler waits for its signal to abort and then calls `afterAbort`, and stops
+     * the subscriber once the job is running. Resolves with the row while it ran, the row after stop()
+     * resolved, the signal's reason and the onFailed hook.
+     */
+    async function interrupt(afterAbort: (job: ClaimedJob) => unknown, config = {}){
+        const { publisher, subscriber, row, ...rest } = setup()
+        const { id } = await publisher.writeJob("x", { config: { maxRetries: 3, retryBackoffSeconds: 60, ...config } })
+        await db.admin.query(`UPDATE ${rest.table} SET last_error = 'earlier' WHERE id = $1`, [id])
+        const onFailed = jest.fn()
+        let reason: unknown
+        let started = false
+        const s = subscriber()
+        await s.listen("x", async (job) => {
+            started = true
+            await aborted(job)
+            reason = job.signal.reason
+            await afterAbort(job)
+        }, { onFailed })
+        await waitFor(() => started)
+        const running = await row(id)
+
+        await s.stop()
+
+        return { id, running, stopped: await row(id), reason, onFailed, publisher, subscriber, row, ...rest }
+    }
+
+    /** Expects the job back to pending, due now, with the interrupted attempt refunded and the rest unchanged. */
+    function expectReleased(running: Record<string, unknown>, stopped: Record<string, unknown>){
+        expect(stopped).toMatchObject({
+            status: "pending",
+            attempts: (running.attempts as number) - 1,
+            last_error: "earlier",
+            locked_by: null,
+            locked_until: null,
+            finished_at: null,
+        })
+        expect((stopped.run_after as Date).getTime()).toBeLessThanOrEqual(Date.now())
+    }
+
+    it("aborts job.signal with a SubscriberStoppedError and releases a job whose handler throws", async () => {
+        const { running, stopped, reason, onFailed } = await interrupt((job) => {
+            throw job.signal.reason
+        })
+
+        expect(reason).toBeInstanceOf(SubscriberStoppedError)
+        expect(running).toMatchObject({ status: "running", attempts: 1 })
+        expectReleased(running, stopped)
+        expect(onFailed).not.toHaveBeenCalled()
+    })
+
+    it("releases a job whose handler returns without finishing it", async () => {
+        const { running, stopped } = await interrupt(() => {})
+
+        expectReleased(running, stopped)
+    })
+
+    it("releases a job the handler fails with retries allowed", async () => {
+        const { running, stopped, onFailed } = await interrupt((job) => job.fail(new Error("stopped")))
+
+        expectReleased(running, stopped)
+        expect(onFailed).not.toHaveBeenCalled()
+    })
+
+    it("fails a job the handler fails with retry: false, and calls onFailed", async () => {
+        const { stopped, onFailed } = await interrupt((job) => job.fail(new Error("permanent"), { retry: false }))
+
+        expect(stopped).toMatchObject({ status: "failed", last_error: "permanent" })
+        expect(onFailed).toHaveBeenCalledTimes(1)
+    })
+
+    it("marks a job the handler completes after the abort as succeeded", async () => {
+        const { stopped } = await interrupt((job) => job.complete())
+
+        expect(stopped.status).toBe("succeeded")
+    })
+
+    it("lets a new subscriber claim a released job straight away, with the interrupted run's attempts", async () => {
+        const { running, subscriber, row, id } = await interrupt((job) => { throw job.signal.reason })
+        const attempts: number[] = []
+
+        await subscriber().listen("x", async (job) => {
+            attempts.push(job.attempts)
+            await job.complete()
+        })
+
+        await waitFor(async () => (await row(id)).status === "succeeded", 2_000)
+        expect(attempts).toEqual([running.attempts])
+    })
+
+    it("releases a job interrupted on its final attempt, which then runs normally", async () => {
+        const { running, stopped, subscriber, row, id, onFailed } = await interrupt((job) => { throw job.signal.reason }, { maxRetries: 0 })
+        expectReleased(running, stopped)
+        expect(onFailed).not.toHaveBeenCalled()
+        const handler = jest.fn((job: ClaimedJob) => job.complete())
+
+        await subscriber().listen("x", handler)
+
+        await waitFor(async () => (await row(id)).status === "succeeded")
+        expect(handler).toHaveBeenCalledTimes(1)
+        expect((await row(id)).attempts).toBe(1)
+    })
+
+    it("keeps renewing the lock while an aborted handler winds down", async () => {
+        const { publisher, subscriber, row } = setup()
+        const { id } = await publisher.writeJob("x", { config: { lockTtlSeconds: 1 } })
+        const claims: string[] = []
+        let started = false
+        const s = subscriber()
+        await s.listen("x", async (job) => {
+            started = true
+            await aborted(job)
+            await sleep(2_500) // longer than the lock TTL: only renewal keeps the job
+            throw job.signal.reason
+        })
+        await waitFor(() => started)
+        await subscriber().listen("x", async (job) => {
+            claims.push(job.id)
+            await job.complete()
+        })
+
+        let stopped = false
+        await s.stop().then(() => (stopped = true))
+        const claimedDuringWindDown = claims.length
+        await waitFor(async () => (await row(id)).status === "succeeded")
+
+        expect(stopped).toBe(true)
+        expect(claimedDuringWindDown).toBe(0)
+        expect(claims).toEqual([id])
+    })
+
+    it("keeps a lost lock's LockLostError as the reason and writes nothing", async () => {
+        const { table, publisher, subscriber, row } = setup()
+        const { id } = await publisher.writeJob("x", { config: { lockTtlSeconds: 1 } })
+        let reason: unknown
+        let lost = false
+        const s = subscriber()
+        await s.listen("x", async (job) => {
+            await db.admin.query(`UPDATE ${table} SET locked_by = 'another-worker' WHERE id = $1`, [job.id])
+            await aborted(job)
+            lost = true
+            await sleep(100)
+            reason = job.signal.reason
+            throw job.signal.reason
+        })
+        await waitFor(() => lost)
+
+        await s.stop()
+
+        expect(reason).toBeInstanceOf(LockLostError)
+        expect(await row(id)).toMatchObject({ status: "running", attempts: 1, locked_by: "another-worker" })
+    })
+
+    it("returns the same promise when called twice, and releases each job once", async () => {
+        const { publisher, subscriber, row } = setup()
+        const { id } = await publisher.writeJob("x")
+        let started = false
+        const s = subscriber()
+        await s.listen("x", async (job) => {
+            started = true
+            await aborted(job)
+            throw job.signal.reason
+        })
+        await waitFor(() => started)
+
+        const first = s.stop()
+        const second = s.stop()
+
+        expect(second).toBe(first)
+        await expect(Promise.all([first, second])).resolves.toBeDefined()
+        expect(await row(id)).toMatchObject({ status: "pending", attempts: 0 })
     })
 })
 

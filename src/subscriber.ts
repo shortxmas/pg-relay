@@ -39,7 +39,7 @@ export type ClaimedJob<TPayload extends JobPayload = JobPayload, TName extends s
     // runs started so far, counting this one
     attempts: number
     maxRetries: number
-    // aborts with LockLostError if another worker takes over the job
+    // aborts with LockLostError if another worker takes over the job, or SubscriberStoppedError on stop()
     signal: AbortSignal
     /** Marks the job succeeded. false when the lock was lost and the outcome was dropped. */
     complete(): Promise<boolean>
@@ -75,6 +75,19 @@ export class LockLostError extends Error{
     }
 }
 
+/** The subscriber was stopped while the job ran: job.signal's reason after stop(). */
+export class SubscriberStoppedError extends Error{
+    constructor(jobId: string){
+        super(`pg-relay: the subscriber was stopped while job ${jobId} was running`)
+        this.name = "SubscriberStoppedError"
+    }
+}
+
+export type StopOptions = {
+    // false waits for running handlers without aborting them. Default true.
+    abort?: boolean
+}
+
 /** Seconds before the retry that follows the `attempts`-th failed attempt: backoff x 2^(attempts-1). */
 export function retryDelaySeconds(retryBackoffSeconds: number, attempts: number): number{
     return retryBackoffSeconds * 2 ** (attempts - 1)
@@ -102,6 +115,10 @@ export class Subscriber<TName extends string = string>{
     private readonly listening = new Set<string>()
     private readonly loops: Promise<void>[] = []
     private readonly stopping = new AbortController()
+    private stopped?: Promise<void>
+    private abortOnStop = false
+    // aborts each running job's signal with SubscriberStoppedError
+    private readonly running = new Set<() => void>()
 
     constructor(queue: PgQueue<TName>, config: SubscriberConfig = {}){
         const { logger, ...listenConfig } = config
@@ -141,10 +158,19 @@ export class Subscriber<TName extends string = string>{
         }
     }
 
-    /** Stops claiming jobs and resolves once every running handler has finished. */
-    async stop(): Promise<void>{
-        this.stopping.abort()
-        await Promise.all(this.loops)
+    /**
+     * Stops claiming jobs, aborts every running job's signal with SubscriberStoppedError (unless `abort`
+     * is false), and resolves once every handler and onFailed hook has settled. A job a stop interrupts
+     * is put back to pending, due now, without using up an attempt. Later calls return the same promise.
+     */
+    stop(options: StopOptions = {}): Promise<void>{
+        this.stopped ??= (async () => {
+            this.abortOnStop = options.abort !== false
+            this.stopping.abort()
+            if(this.abortOnStop) for(const abort of this.running) abort()
+            await Promise.all(this.loops)
+        })()
+        return this.stopped
     }
 
     /** Polls until stopped: straight away after a claimed job, otherwise after `intervalMs`. */
@@ -205,6 +231,12 @@ export class Subscriber<TName extends string = string>{
         let acked = false
         // set when this run's failed write lands; onFailed gets it once the handler has settled
         let failed: FailedJob | undefined
+        const abortForStop = () => {
+            if(!lock.signal.aborted) lock.abort(new SubscriberStoppedError(row.id))
+        }
+        this.running.add(abortForStop)
+        // claimed while stop() was already aborting jobs
+        if(this.abortOnStop) abortForStop()
 
         const heartbeat = setInterval(() => {
             this.renewLock(row.id, lockedBy).then((held) => {
@@ -227,6 +259,10 @@ export class Subscriber<TName extends string = string>{
         }
 
         const fail = (error: unknown, options: FailOptions = {}) => ack(async () => {
+            // A retryable failure after a stop is taken to be the stop: nothing went wrong with the job.
+            if(lock.signal.reason instanceof SubscriberStoppedError && options.retry !== false){
+                return this.requeue(row.id, lockedBy)
+            }
             const retry = options.retry !== false && row.attempts <= row.max_retries
             const held = await this.release(row.id, lockedBy, retry
                 ? { status: "pending", error: error, delaySeconds: retryDelaySeconds(row.retry_backoff_seconds, row.attempts) }
@@ -254,6 +290,7 @@ export class Subscriber<TName extends string = string>{
             else await fail(error)
         }finally{
             clearInterval(heartbeat)
+            this.running.delete(abortForStop)
         }
         if(failed) await this.notifyFailed(onFailed, failed)
     }
@@ -273,6 +310,26 @@ export class Subscriber<TName extends string = string>{
         const { rowCount } = await this.queue.pool.query(
             `UPDATE ${this.queue.qualifiedTableName}
              SET locked_until = now() + make_interval(secs => lock_ttl_seconds), updated_at = now()
+             WHERE id = $1 AND status = 'running' AND locked_by = $2`,
+            [id, lockedBy],
+        )
+        return rowCount === 1
+    }
+
+    /**
+     * Puts a job a stop interrupted back to pending, due now, refunding the attempt. last_error is kept.
+     * false when this claim no longer holds the job, in which case nothing changes.
+     */
+    private async requeue(id: string, lockedBy: string): Promise<boolean>{
+        const { rowCount } = await this.queue.pool.query(
+            `UPDATE ${this.queue.qualifiedTableName}
+             SET status = 'pending',
+                 attempts = attempts - 1,
+                 run_after = now(),
+                 finished_at = NULL,
+                 locked_by = NULL,
+                 locked_until = NULL,
+                 updated_at = now()
              WHERE id = $1 AND status = 'running' AND locked_by = $2`,
             [id, lockedBy],
         )
