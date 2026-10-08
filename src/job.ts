@@ -70,3 +70,24 @@ export type JobRecord<TPayload extends JobPayload = JobPayload, TName extends st
     updatedAt: Date
     finishedAt: Date | null
 }
+
+/** Which job names queue.stats() counts. */
+export type JobStatsFilter<TName extends string = string> = {
+    name?: TName | TName[]
+}
+
+/** One job name's counts from queue.stats(), all measured with the database's now(). */
+export type JobNameStats<TName extends string = string> = {
+    name: TName
+    // status = 'pending', due or not
+    pending: number
+    // pending with run_after <= now(): what a worker would claim right now
+    due: number
+    running: number
+    succeeded: number
+    failed: number
+    // seconds since the run_after of the oldest due job; null when none are due
+    oldestDueSeconds: number | null
+    // running with locked_until < now(): their worker stopped renewing the lock
+    expiredLocks: number
+}
