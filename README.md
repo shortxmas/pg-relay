@@ -69,7 +69,7 @@ await subscriber.listen("geminiAiWorkflow", async (job) => {
 
 for (const signal of ["SIGTERM", "SIGINT"] as const) {
   process.once(signal, async () => {
-    await subscriber.stop()   // stops claiming, waits for running handlers
+    await subscriber.stop()   // stops claiming, aborts running jobs' signals, waits for handlers to settle
     await subscriber.queue.close()
     process.exit(0)
   })
@@ -128,7 +128,7 @@ While a job with the same name and `dedupeKey` is pending or running, `writeJob`
 ```ts
 new Subscriber(queue, config?: SubscriberConfig)
 subscriber.listen(name: string, handler: (job: ClaimedJob) => unknown, config?: ListenConfig & { onFailed?: (job: FailedJob) => unknown }): Promise<void>
-subscriber.stop(): Promise<void>
+subscriber.stop(options?: { abort?: boolean }): Promise<void>
 ```
 
 | Config | Default | Meaning |
@@ -149,7 +149,8 @@ type ClaimedJob = {
   payload: JobPayload
   attempts: number          // runs started so far, counting this one
   maxRetries: number
-  signal: AbortSignal       // aborts with LockLostError if another worker takes the job over
+  signal: AbortSignal       // aborts with LockLostError if another worker takes the job over,
+                            // or SubscriberStoppedError when subscriber.stop() runs
   complete(): Promise<boolean>
   fail(error: unknown, options?: { retry?: boolean }): Promise<boolean>
 }
@@ -205,7 +206,7 @@ It's called every time pg-relay moves a job of that name to `failed`:
 - a claim finds a job whose final attempt was already started by a worker that died. The handler isn't called, and `error` is absent.
 
 How it runs:
-- Only when the `failed` write landed. If this worker lost the lock, nothing is written and the hook isn't called. Never for `succeeded`, or for a retry back to `pending`.
+- Only when the `failed` write landed. If this worker lost the lock, nothing is written and the hook isn't called. Never for `succeeded`, for a retry back to `pending`, or for a job [released by `stop()`](#stopping-the-worker).
 - After the handler has returned or thrown, never at the same time as it.
 - In the job's slot: the slot doesn't claim its next job until the hook settles, and `stop()` waits for it.
 - If it throws, the error goes to `logger.error` and the job stays `failed`. It isn't retried, so make its writes safe to repeat.
@@ -213,6 +214,42 @@ How it runs:
 - The payload is passed as stored. A malformed payload may be why the job failed, so check it before using it.
 
 The hook is **best effort**. It runs after the `failed` write commits, so a worker that dies in the milliseconds between the two never calls it. If you need certainty, also run a reconciliation sweep that reads `queue.listJobs({ name, status: "failed" })` on a schedule and updates any records still marked in progress.
+
+### Stopping the worker
+
+Workers get stopped all the time: every deploy, scale-down or node drain sends SIGTERM, waits a grace period (30 seconds by default on Kubernetes), then SIGKILLs. A job that calls a model or renders a document can easily run longer than that. `stop()` lets such a job stop cleanly and go straight back to the queue, instead of being killed mid-step and waiting out its lock:
+
+```ts
+process.once("SIGTERM", async () => {
+  await subscriber.stop()          // aborts every running job.signal with SubscriberStoppedError
+  await subscriber.queue.close()
+  process.exit(0)
+})
+
+await subscriber.listen("generate-report", async (job) => {
+  const report = await callModel(input, { signal: job.signal })   // throws as soon as stop() runs
+  await saveReport(job.id, report)
+  await job.complete()
+})
+// interrupted by stop() → the job is pending again, due now, with the attempt refunded
+```
+
+`stop()` stops claiming, aborts each running job's `signal` with a `SubscriberStoppedError`, and resolves once every handler and `onFailed` hook has settled. The lock keeps being renewed while a handler winds down, so no other worker takes the job in the meantime. Use `job.signal.reason instanceof SubscriberStoppedError` to tell a stop apart from a lost lock (`LockLostError`). A job whose signal already aborted for a lost lock keeps that reason, and nothing is written for it.
+
+After a stop aborts a job, the handler decides what happens:
+
+| Handler | Result |
+|---|---|
+| Calls `complete()` (finished in time) | `succeeded` |
+| Throws, or returns without finishing the job | Released |
+| Calls `fail(error)` | Released: a retryable failure after a stop is taken to be the stop |
+| Calls `fail(error, { retry: false })` | `failed`, and `onFailed` is called |
+
+A released job goes back to `pending`, due now with no backoff, and the interrupted attempt doesn't count: `attempts` goes back down by one. `lastError` is kept as it was. `onFailed` isn't called, because the job didn't fail. A job interrupted on its final attempt is released too, rather than marked `failed`, so a deploy never uses up a job's retries.
+
+Refunding the attempt can't make a job loop forever. Only `stop()` refunds one. A worker that crashes or runs out of memory never gets that far, so its attempt still counts. A handler that ignores its signal is still waited on, and if SIGKILL comes first the job falls back to the normal path: its lock expires and the attempt counts.
+
+`stop({ abort: false })` stops claiming and waits for running handlers without aborting them, for workers whose jobs are short enough to finish within the grace period. Calling `stop()` again while one is in progress returns the same promise.
 
 ## Checking on jobs
 
