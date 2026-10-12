@@ -6,5 +6,5 @@ export { PgQueue, PgRelayInitError, type PgQueueOptions } from "./queue"
 export { DEFAULT_JOB_CONFIG, Publisher, type TransactionClient, type WriteOptions, type WriteResult } from "./publisher"
 export {
     type ClaimedJob, DEFAULT_LISTEN_CONFIG, type FailedHook, type FailedJob, type FailOptions, type JobHandler, type ListenConfig, LockLostError,
-    retryDelaySeconds, type StopOptions, Subscriber, type SubscriberConfig, type SubscriberLogger, SubscriberStoppedError,
+    retryDelaySeconds, RuntimeExceededError, type StopOptions, Subscriber, type SubscriberConfig, type SubscriberLogger, SubscriberStoppedError,
 } from "./subscriber"

@@ -8,7 +8,11 @@ export type ListenConfig = {
     concurrency?: number
     // seconds to wait after a poll finds nothing (or fails) before polling again
     pollIntervalSeconds?: number
+    // seconds a handler may run before its attempt fails and pg-relay stops waiting for it. Unset: no limit
+    maxRuntimeSeconds?: number
 }
+
+type ResolvedListenConfig = ListenConfig & Required<Pick<ListenConfig, "concurrency" | "pollIntervalSeconds">>
 
 export type SubscriberLogger = {
     warn(...args: unknown[]): void
@@ -21,7 +25,7 @@ export type SubscriberConfig = ListenConfig & {
     logger?: SubscriberLogger
 }
 
-export const DEFAULT_LISTEN_CONFIG: Required<ListenConfig> = {
+export const DEFAULT_LISTEN_CONFIG: ResolvedListenConfig = {
     concurrency: 1,
     pollIntervalSeconds: 5,
 }
@@ -39,9 +43,10 @@ export type ClaimedJob<TPayload extends JobPayload = JobPayload, TName extends s
     // runs started so far, counting this one
     attempts: number
     maxRetries: number
-    // aborts with LockLostError if another worker takes over the job, or SubscriberStoppedError on stop()
+    // aborts with LockLostError if another worker takes over the job, SubscriberStoppedError on stop(),
+    // or RuntimeExceededError once the handler has run for maxRuntimeSeconds
     signal: AbortSignal
-    /** Marks the job succeeded. false when the lock was lost and the outcome was dropped. */
+    /** Marks the job succeeded. false when the outcome was dropped: the lock was lost, or the handler was abandoned. */
     complete(): Promise<boolean>
     /** Retries the job after its backoff, or fails it when no retries are left or `retry` is false. */
     fail(error: unknown, options?: FailOptions): Promise<boolean>
@@ -83,6 +88,17 @@ export class SubscriberStoppedError extends Error{
     }
 }
 
+/** The handler ran for its maxRuntimeSeconds: job.signal's reason, and the error the attempt fails with. */
+export class RuntimeExceededError extends Error{
+    readonly maxRuntimeSeconds: number
+
+    constructor(jobId: string, maxRuntimeSeconds: number){
+        super(`pg-relay: job ${jobId} exceeded maxRuntimeSeconds (${maxRuntimeSeconds})`)
+        this.name = "RuntimeExceededError"
+        this.maxRuntimeSeconds = maxRuntimeSeconds
+    }
+}
+
 export type StopOptions = {
     // false waits for running handlers without aborting them. Default true.
     abort?: boolean
@@ -94,8 +110,17 @@ export function retryDelaySeconds(retryBackoffSeconds: number, attempts: number)
 }
 
 const MAX_ERROR_LENGTH = 4096
+// the longest delay setTimeout takes; anything longer fires after 1ms
+const MAX_RUNTIME_SECONDS = Math.floor((2 ** 31 - 1) / 1000)
 const NO_ACK = "handler returned without calling complete or fail"
 const FINAL_ATTEMPT = "worker stopped during the final attempt"
+
+/** What one listen hands each job it claims to. */
+type Listener = {
+    handler: JobHandler
+    onFailed?: FailedHook
+    maxRuntimeSeconds?: number
+}
 
 type ClaimedRow = {
     id: string
@@ -110,7 +135,7 @@ type ClaimedRow = {
 /** Claims and runs jobs from a queue. Used by the worker. */
 export class Subscriber<TName extends string = string>{
     readonly queue: PgQueue<TName>
-    private readonly config: Required<ListenConfig>
+    private readonly config: ResolvedListenConfig
     private readonly logger: SubscriberLogger
     private readonly listening = new Set<string>()
     private readonly loops: Promise<void>[] = []
@@ -143,7 +168,7 @@ export class Subscriber<TName extends string = string>{
         if(this.stopping.signal.aborted) throw new Error("pg-relay: this subscriber was stopped")
         if(this.listening.has(name)) throw new Error(`pg-relay: already listening for "${name}"`)
         const { onFailed, ...listenConfig } = config
-        const { concurrency, pollIntervalSeconds } = resolveListenConfig(this.config, listenConfig)
+        const { concurrency, pollIntervalSeconds, maxRuntimeSeconds } = resolveListenConfig(this.config, listenConfig)
 
         this.listening.add(name)
         try{
@@ -154,14 +179,19 @@ export class Subscriber<TName extends string = string>{
         }
 
         for(let i = 0; i < concurrency; i++){
-            this.loops.push(this.pollLoop(name, handler as unknown as JobHandler, onFailed as FailedHook | undefined, pollIntervalSeconds * 1000))
+            this.loops.push(this.pollLoop(
+                name,
+                { handler: handler as unknown as JobHandler, onFailed: onFailed as FailedHook | undefined, maxRuntimeSeconds },
+                pollIntervalSeconds * 1000,
+            ))
         }
     }
 
     /**
      * Stops claiming jobs, aborts every running job's signal with SubscriberStoppedError (unless `abort`
-     * is false), and resolves once every handler and onFailed hook has settled. A job a stop interrupts
-     * is put back to pending, due now, without using up an attempt. Later calls return the same promise.
+     * is false), and resolves once every handler and onFailed hook has settled, or the handler was abandoned
+     * for exceeding maxRuntimeSeconds. A job a stop interrupts is put back to pending, due now, without
+     * using up an attempt. Later calls return the same promise.
      */
     stop(options: StopOptions = {}): Promise<void>{
         this.stopped ??= (async () => {
@@ -174,12 +204,12 @@ export class Subscriber<TName extends string = string>{
     }
 
     /** Polls until stopped: straight away after a claimed job, otherwise after `intervalMs`. */
-    private async pollLoop(name: string, handler: JobHandler, onFailed: FailedHook | undefined, intervalMs: number): Promise<void>{
+    private async pollLoop(name: string, listener: Listener, intervalMs: number): Promise<void>{
         const signal = this.stopping.signal
         while(!signal.aborted){
             let claimed = false
             try{
-                claimed = await this.processNext(name, handler, onFailed)
+                claimed = await this.processNext(name, listener)
             }catch(error){
                 this.logger.error(`pg-relay: processing "${name}" failed:`, error)
             }
@@ -188,7 +218,7 @@ export class Subscriber<TName extends string = string>{
     }
 
     /** Claims the next due job called `name` and runs it. false when there was nothing to claim. */
-    private async processNext(name: string, handler: JobHandler, onFailed?: FailedHook): Promise<boolean>{
+    private async processNext(name: string, listener: Listener): Promise<boolean>{
         // A fresh token per claim, so acks can only land while this claim still holds the job.
         const lockedBy = `${hostname()}:${process.pid}:${randomUUID().slice(0, 8)}`
         const table = this.queue.qualifiedTableName
@@ -217,19 +247,23 @@ export class Subscriber<TName extends string = string>{
         // Its last allowed attempt was already started by a worker that died; don't run it again.
         if(row.attempts > row.max_retries + 1){
             if(await this.release(row.id, lockedBy, { status: "failed", error: FINAL_ATTEMPT })){
-                await this.notifyFailed(onFailed, failedJob(row, FINAL_ATTEMPT))
+                await this.notifyFailed(listener.onFailed, failedJob(row, FINAL_ATTEMPT))
             }
             return true
         }
 
-        await this.run(row, lockedBy, handler, onFailed)
+        await this.run(row, lockedBy, listener)
         return true
     }
 
-    private async run(row: ClaimedRow, lockedBy: string, handler: JobHandler, onFailed?: FailedHook): Promise<void>{
+    private async run(row: ClaimedRow, lockedBy: string, { handler, onFailed, maxRuntimeSeconds }: Listener): Promise<void>{
         const lock = new AbortController()
         let acked = false
-        // set when this run's failed write lands; onFailed gets it once the handler has settled
+        // the write of this run's ack, once one was made
+        let ackWrite: Promise<boolean> | undefined
+        // set once the handler ran past maxRuntimeSeconds and pg-relay stopped waiting for it
+        let abandoned = false
+        // set when this run's failed write lands; onFailed gets it once the handler has settled or been abandoned
         let failed: FailedJob | undefined
         const abortForStop = () => {
             if(!lock.signal.aborted) lock.abort(new SubscriberStoppedError(row.id))
@@ -249,18 +283,27 @@ export class Subscriber<TName extends string = string>{
             })
         }, row.lock_ttl_seconds * 1000 / 3)
 
-        const ack = async (finish: () => Promise<boolean>): Promise<boolean> => {
+        const settle = async (finish: () => Promise<boolean>): Promise<boolean> => {
             if(acked) throw new Error(`pg-relay: job ${row.id} was already completed or failed`)
             acked = true
             clearInterval(heartbeat)
-            const held = await finish()
+            ackWrite = finish()
+            const held = await ackWrite
             if(!held) this.logger.warn(`pg-relay: job ${row.id} lost its lock; its outcome was dropped`)
             return held
         }
 
-        const fail = (error: unknown, options: FailOptions = {}) => ack(async () => {
+        // An abandoned handler's outcome no longer counts: the timeout already settled the attempt.
+        const ack = async (finish: () => Promise<boolean>): Promise<boolean> => {
+            if(!abandoned) return settle(finish)
+            this.logger.warn(`pg-relay: job ${row.id} was completed or failed after its handler was abandoned (exceeded maxRuntimeSeconds); ignored`)
+            return false
+        }
+
+        const failure = (error: unknown, options: FailOptions = {}) => async () => {
             // A retryable failure after a stop is taken to be the stop: nothing went wrong with the job.
-            if(lock.signal.reason instanceof SubscriberStoppedError && options.retry !== false){
+            // Running out of time isn't: the job itself hung.
+            if(lock.signal.reason instanceof SubscriberStoppedError && options.retry !== false && !(error instanceof RuntimeExceededError)){
                 return this.requeue(row.id, lockedBy)
             }
             const retry = options.retry !== false && row.attempts <= row.max_retries
@@ -269,7 +312,8 @@ export class Subscriber<TName extends string = string>{
                 : { status: "failed", error: error })
             if(held && !retry) failed = { ...failedJob(row, errorMessage(error)), error }
             return held
-        })
+        }
+        const fail = (error: unknown, options?: FailOptions) => ack(failure(error, options))
 
         const job: ClaimedJob = {
             id: row.id,
@@ -282,13 +326,38 @@ export class Subscriber<TName extends string = string>{
             fail,
         }
 
+        const handled = (async () => {
+            try{
+                await handler(job)
+                if(!acked && !abandoned) await fail(new Error(NO_ACK))
+            }catch(error){
+                if(abandoned) this.logger.error(`pg-relay: abandoned handler for job ${row.id} threw:`, error)
+                else if(acked) this.logger.error(`pg-relay: handler for job ${row.id} threw after finishing it:`, error)
+                else await fail(error)
+            }
+        })()
+
+        // A promise can't be cancelled, so stop waiting for the handler and settle the attempt here instead.
+        const abandon = async (maxRuntimeSeconds: number) => {
+            abandoned = true
+            handled.catch((error: unknown) => this.logger.error(`pg-relay: abandoned handler for job ${row.id} failed:`, error))
+            this.logger.warn(`pg-relay: handler for job ${row.id} was still running after maxRuntimeSeconds (${maxRuntimeSeconds}); abandoned it`)
+            const exceeded = new RuntimeExceededError(row.id, maxRuntimeSeconds)
+            if(!lock.signal.aborted) lock.abort(exceeded)
+            // Already finished, or another worker holds the job: nothing more to write.
+            if(acked) await ackWrite?.catch(() => {})
+            else if(!(lock.signal.reason instanceof LockLostError)) await settle(failure(exceeded))
+        }
+
+        let timer: NodeJS.Timeout | undefined
         try{
-            await handler(job)
-            if(!acked) await fail(new Error(NO_ACK))
-        }catch(error){
-            if(acked) this.logger.error(`pg-relay: handler for job ${row.id} threw after finishing it:`, error)
-            else await fail(error)
+            const timeout = maxRuntimeSeconds === undefined
+                ? []
+                : [new Promise<number>((resolve) => (timer = setTimeout(() => resolve(maxRuntimeSeconds), maxRuntimeSeconds * 1000)))]
+            const exceeded = await Promise.race([handled.then(() => undefined), ...timeout])
+            if(exceeded !== undefined) await abandon(exceeded)
         }finally{
+            clearTimeout(timer)
             clearInterval(heartbeat)
             this.running.delete(abortForStop)
         }
@@ -373,13 +442,19 @@ function failedJob(row: ClaimedRow, lastError: string): FailedJob{
     return { id: row.id, name: row.name, payload: row.payload, attempts: row.attempts, maxRetries: row.max_retries, lastError }
 }
 
-function resolveListenConfig(defaults: Required<ListenConfig>, config: ListenConfig): Required<ListenConfig>{
-    const resolved = { ...defaults, ...config }
+function resolveListenConfig(defaults: ResolvedListenConfig, config: ListenConfig): ResolvedListenConfig{
+    const resolved = { ...defaults }
+    // an option left undefined keeps the default
+    for(const [key, value] of Object.entries(config)) if(value !== undefined) Object.assign(resolved, { [key]: value })
     if(!Number.isInteger(resolved.concurrency) || resolved.concurrency < 1){
         throw new Error(`pg-relay: concurrency must be a whole number of 1 or more, got ${resolved.concurrency}`)
     }
     if(!(resolved.pollIntervalSeconds > 0)){
         throw new Error(`pg-relay: pollIntervalSeconds must be more than 0, got ${resolved.pollIntervalSeconds}`)
+    }
+    const { maxRuntimeSeconds } = resolved
+    if(maxRuntimeSeconds !== undefined && !(maxRuntimeSeconds > 0 && maxRuntimeSeconds <= MAX_RUNTIME_SECONDS)){
+        throw new Error(`pg-relay: maxRuntimeSeconds must be more than 0 and at most ${MAX_RUNTIME_SECONDS} (about 24.8 days), got ${maxRuntimeSeconds}`)
     }
     return resolved
 }

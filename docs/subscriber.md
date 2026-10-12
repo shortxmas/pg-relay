@@ -20,8 +20,8 @@ Constructing one does no I/O. It throws if the config is invalid (see [`ListenCo
 | `logger` | `console` | A `SubscriberLogger`, `{ warn(...args), error(...args) }`. Subscriber-wide only. |
 
 What gets logged:
-- `error`: a poll or claim query failed (the slot retries after `pollIntervalSeconds`), a handler threw after it had already finished its job, or an `onFailed` hook threw.
-- `warn`: renewing a lock failed (it's retried until the lock actually expires), or an ack was dropped because the lock was lost.
+- `error`: a poll or claim query failed (the slot retries after `pollIntervalSeconds`), a handler threw after it had already finished its job, an abandoned handler threw, or an `onFailed` hook threw.
+- `warn`: renewing a lock failed (it's retried until the lock actually expires), an ack was dropped because the lock was lost, a handler was abandoned for exceeding `maxRuntimeSeconds`, or an abandoned handler called `complete`/`fail`.
 
 ### `ListenConfig`
 
@@ -29,8 +29,9 @@ What gets logged:
 |---|---|---|---|
 | `concurrency` | `1` | whole number ≥ 1 | Jobs of one name this subscriber runs at once. Each slot polls on its own. |
 | `pollIntervalSeconds` | `5` | > 0, can be fractional | Wait after a poll that found nothing (or failed). After a claimed job, the slot polls again immediately. |
+| `maxRuntimeSeconds` | none (no limit) | > 0 and ≤ 2147483 (about 24.8 days), can be fractional | How long a handler may run before its attempt fails and pg-relay stops waiting for it. See [Run time limit](#run-time-limit). |
 
-The defaults are exported as `DEFAULT_LISTEN_CONFIG`. Config passed to `new Subscriber` applies to every `listen`. Config passed to one `listen` overrides it for that name.
+The defaults are exported as `DEFAULT_LISTEN_CONFIG`. Config passed to `new Subscriber` applies to every `listen`. Config passed to one `listen` overrides it for that name. An option passed as `undefined` keeps the default.
 
 ## `listen`
 
@@ -74,6 +75,24 @@ While the handler runs, the subscriber renews the lock every `lockTtlSeconds / 3
 
 Pick `lockTtlSeconds` so that a stalled or dead worker is detected in an acceptable time. It doesn't need to cover the job's whole run time, because renewal extends it.
 
+### Run time limit
+
+The lock only expires when the **worker** stops. A handler stuck on an `await` that never settles (a call made without `job.signal`, a stuck socket, a forgotten promise) keeps its lock renewed, its slot taken, and `stop()` waiting, for as long as the process lives. `maxRuntimeSeconds` is the backstop:
+
+```ts
+await subscriber.listen("generate-report", handler, { maxRuntimeSeconds: 1800 })
+```
+
+The timer starts when the job is claimed. If the handler is still running when it fires:
+1. `job.signal` aborts with [`RuntimeExceededError`](#errors), unless it was already aborted, in which case the first reason stays.
+2. pg-relay stops waiting for the handler. A promise can't be cancelled, so the handler is **abandoned**: whatever it rejects with later goes to `logger.error`, and a later `complete`/`fail` resolves `false` and writes nothing.
+3. The attempt fails as if with `fail(new RuntimeExceededError(...))`: retried after its backoff if retries are left, otherwise `failed`, and `onFailed` fires. `lastError` reads `pg-relay: job <id> exceeded maxRuntimeSeconds (1800)`. This holds even when `stop()` aborted the job first: the attempt counts and isn't refunded, so a job that always hangs still runs out of retries.
+4. The slot is freed and claims the next job.
+
+If the handler had already finished the job, or another worker took over its lock, step 3 writes nothing: the outcome already recorded stands. The handler is still abandoned, so cleanup that hangs after `complete()` can't hold a slot.
+
+The limit is a backstop, not a substitute for passing `job.signal`: the abandoned handler keeps running in the background until its promise settles, if it ever does.
+
 ## `ClaimedJob`
 
 ```ts
@@ -83,7 +102,7 @@ type ClaimedJob<TPayload, TName> = {
   payload: TPayload
   attempts: number        // runs started so far, counting this one (1 on the first run)
   maxRetries: number
-  signal: AbortSignal     // aborts with LockLostError or SubscriberStoppedError
+  signal: AbortSignal     // aborts with LockLostError, SubscriberStoppedError or RuntimeExceededError
   complete(): Promise<boolean>
   fail(error: unknown, options?: FailOptions): Promise<boolean>
 }
@@ -107,8 +126,9 @@ Every job is finished by exactly one call to `complete` or `fail`. What the hand
 | Returns without finishing | Same as `fail(new Error("handler returned without calling complete or fail"))` |
 | Throws after finishing | Logged; the outcome stands |
 | Calls `complete`/`fail` a second time | That call throws |
+| Still running after `maxRuntimeSeconds` | Same as `fail(new RuntimeExceededError(...))`, and the handler is abandoned: see [Run time limit](#run-time-limit) |
 
-- `complete` and `fail` resolve `true` when the outcome was written, and `false` when this claim had lost the lock, in which case nothing is written and the other worker's claim stands.
+- `complete` and `fail` resolve `true` when the outcome was written, and `false` when it was dropped: this claim had lost the lock (the other worker's claim stands), or the handler was abandoned (the timeout already settled the attempt). Nothing is written in either case.
 - `lastError` stores the error's `message` (or `String(error)` for a non-Error), truncated to 4096 characters. `complete()` leaves it unchanged.
 - **After a [stop](#stop) aborts the job**, the table differs: see [Stop outcomes](#stop-outcomes).
 
@@ -118,6 +138,7 @@ Every job is finished by exactly one call to `complete` or `fail`. What the hand
 |---|---|---|
 | `LockLostError` | Another worker took the job over | Stop work. Your ack will return `false`. |
 | `SubscriberStoppedError` | `subscriber.stop()` ran | Stop work and throw, or `complete()` if it's done. The job is released without using an attempt. |
+| `RuntimeExceededError` | The handler ran for `maxRuntimeSeconds` | Stop work. The attempt has already failed and your ack will return `false`. |
 
 Pass `job.signal` to anything that takes one (`fetch`, SDK calls, `setTimeout` from `node:timers/promises`), or check `job.signal.aborted` between steps. A reason never changes once set: a job that lost its lock keeps `LockLostError` even if `stop()` runs later.
 
@@ -158,12 +179,13 @@ await subscriber.listen("generate-report", handler, {
 - `fail(error, { retry: false })`
 - `fail(error)` with no retries left
 - the handler throws, or returns without finishing, with no retries left
+- the handler is still running after `maxRuntimeSeconds` on its last attempt (`error` is the `RuntimeExceededError`)
 - a claim finds the job's final attempt was already started by a dead worker (no handler runs, `error` is absent, `attempts` is `maxRetries + 2`)
 
 **When it doesn't:** on `succeeded`, a retry back to `pending`, a job [released by `stop()`](#stop-outcomes), or a failure that wasn't written because the lock was lost.
 
 **How it runs:**
-- After the handler has returned or thrown, never at the same time as it.
+- After the handler has returned or thrown, never at the same time as it. The one exception is a handler abandoned for exceeding `maxRuntimeSeconds`: the hook runs as soon as it's abandoned, while the handler may still be running in the background.
 - In the job's slot: the slot claims nothing else until the hook settles, and `stop()` waits for it.
 - If it throws, the error goes to `logger.error` and the job stays `failed`. It isn't retried, so make its writes safe to repeat.
 - It fires again if `queue.retryJob` resets the job and it fails again.
@@ -177,7 +199,7 @@ subscriber.stop(options?: StopOptions): Promise<void>
 type StopOptions = { abort?: boolean }   // default true
 ```
 
-Stops claiming, aborts every running job's `signal` with a `SubscriberStoppedError`, and resolves once every handler and `onFailed` hook has settled.
+Stops claiming, aborts every running job's `signal` with a `SubscriberStoppedError`, and resolves once every handler and `onFailed` hook has settled, or the handler was abandoned for exceeding `maxRuntimeSeconds`.
 
 ```ts
 for (const signal of ["SIGTERM", "SIGINT"] as const) {
@@ -191,7 +213,8 @@ for (const signal of ["SIGTERM", "SIGINT"] as const) {
 
 - Locks keep being renewed while aborted handlers wind down, so no other worker takes their jobs in the meantime.
 - A job claimed while `stop()` is already running has its signal aborted as soon as its handler starts.
-- A handler that ignores its signal is still waited on. If the process is SIGKILLed first, the job's lock expires and its attempt counts, exactly like a crash.
+- A handler that ignores its signal is still waited on, up to its `maxRuntimeSeconds` if one is set. If the process is SIGKILLed first, the job's lock expires and its attempt counts, exactly like a crash. `maxRuntimeSeconds` bounds how long `stop()` can take, but it only helps within the grace period if it's shorter than that.
+- `onFailed` hooks aren't limited by `maxRuntimeSeconds`, so a hook that hangs still holds up `stop()`.
 - Calling `stop()` again returns the first call's promise. Its options are ignored.
 - After `stop()`, `listen` rejects. Make a new `Subscriber` to listen again.
 - `stop({ abort: false })` stops claiming and waits for handlers without aborting them, for jobs short enough to finish within the deploy's grace period.
@@ -206,19 +229,24 @@ After a stop aborts a job:
 | Throws, or returns without finishing | Released |
 | Calls `fail(error)` | Released: a retryable failure after a stop is taken to be the stop |
 | Calls `fail(error, { retry: false })` | `failed`, and `onFailed` fires |
+| Still running after `maxRuntimeSeconds` | Not released: the attempt counts, as in [Run time limit](#run-time-limit) |
 
 **Released** means back to `pending`, due now with no backoff, with `attempts` one lower (the interrupted run doesn't count), `lastError` unchanged, and the lock cleared. `onFailed` doesn't fire. A job interrupted on its final attempt is released too, so a deploy never uses up a job's retries.
 
-This can't make a job loop forever. Only `stop()` refunds an attempt, and a worker that crashes or runs out of memory never gets that far, so its attempts still count.
+This can't make a job loop forever. Only `stop()` refunds an attempt, and a worker that crashes or runs out of memory never gets that far, so its attempts still count. Neither does a handler that hangs past `maxRuntimeSeconds`.
 
 ## Errors
 
 ```ts
 class LockLostError extends Error { name: "LockLostError" }                     // this worker lost the job's lock
 class SubscriberStoppedError extends Error { name: "SubscriberStoppedError" }   // stop() interrupted the job
+class RuntimeExceededError extends Error {                                     // the handler ran past maxRuntimeSeconds
+  name: "RuntimeExceededError"
+  maxRuntimeSeconds: number
+}
 ```
 
-Both are only ever used as `job.signal.reason`. Tell them apart with `instanceof`.
+They're used as `job.signal.reason`, and `RuntimeExceededError` is also the error a timed-out attempt fails with (`onFailed`'s `error`). Tell them apart with `instanceof`.
 
 ## `retryDelaySeconds`
 
