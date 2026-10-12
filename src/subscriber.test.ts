@@ -1,7 +1,8 @@
 import { Publisher } from "./publisher"
 import { PgQueue, PgRelayInitError } from "./queue"
 import {
-    type ClaimedJob, type FailedJob, LockLostError, retryDelaySeconds, Subscriber, type SubscriberConfig, SubscriberStoppedError,
+    type ClaimedJob, type FailedJob, LockLostError, retryDelaySeconds, RuntimeExceededError, Subscriber, type SubscriberConfig,
+    SubscriberStoppedError,
 } from "./subscriber"
 import { DATABASE_URL, useTestDb } from "./testing/db"
 
@@ -158,6 +159,11 @@ describe("listen", () => {
         [{ concurrency: 0 }, /concurrency/],
         [{ concurrency: 1.5 }, /concurrency/],
         [{ pollIntervalSeconds: 0 }, /pollIntervalSeconds/],
+        [{ maxRuntimeSeconds: 0 }, /maxRuntimeSeconds/],
+        [{ maxRuntimeSeconds: -1 }, /maxRuntimeSeconds/],
+        [{ maxRuntimeSeconds: NaN }, /maxRuntimeSeconds/],
+        [{ maxRuntimeSeconds: Infinity }, /maxRuntimeSeconds/],
+        [{ maxRuntimeSeconds: 2_147_484 }, /maxRuntimeSeconds/],
     ])("rejects the config %p", async (config, message) => {
         const { subscriber } = setup()
 
@@ -881,6 +887,239 @@ describe("onFailed", () => {
 
         await waitFor(() => calls.length === 2)
         expect(calls.map((job) => job.id)).toEqual([id, id])
+    })
+})
+
+describe("maxRuntimeSeconds", () => {
+    // a handler stuck on an await that never settles, ignoring job.signal
+    const hang = () => new Promise<never>(() => {})
+
+    /** Resolves with the job's row once its first attempt has failed and it's waiting to retry. */
+    const retrying = (row: ReturnType<typeof setup>["row"], id: string) => waitFor(async () => {
+        const r = await row(id)
+        return r.status === "pending" && r.attempts === 1 && r
+    })
+
+    /** A logger whose calls the test can read. */
+    function spyLogger(){
+        return { warn: jest.fn(), error: jest.fn() }
+    }
+
+    it("accepts fractions and values up to about 24.8 days", () => {
+        const { subscriber } = setup()
+
+        expect(() => subscriber({ maxRuntimeSeconds: 0.5 })).not.toThrow()
+        expect(() => subscriber({ maxRuntimeSeconds: 2_147_483 })).not.toThrow()
+    })
+
+    it("aborts job.signal with a RuntimeExceededError and retries the attempt after its backoff", async () => {
+        const { publisher, subscriber, row } = setup()
+        const { id } = await publisher.writeJob("x", { config: { maxRetries: 3, retryBackoffSeconds: 60 } })
+        let reason: unknown
+
+        await subscriber().listen("x", (job) => {
+            job.signal.addEventListener("abort", () => (reason = job.signal.reason))
+            return hang()
+        }, { maxRuntimeSeconds: 0.2 })
+
+        const retried = await retrying(row, id)
+        expect(reason).toBeInstanceOf(RuntimeExceededError)
+        expect(retried).toMatchObject({ attempts: 1, locked_by: null, locked_until: null })
+        expect(retried.last_error).toMatch(/exceeded maxRuntimeSeconds \(0\.2\)/)
+        expect(retried.run_after.getTime() - retried.updated_at.getTime()).toBe(60_000)
+    })
+
+    it("fails the job for good on its last attempt and calls onFailed", async () => {
+        const { publisher, subscriber, row } = setup()
+        const { id } = await publisher.writeJob("x", { config: { maxRetries: 0 } })
+        const onFailed = jest.fn()
+
+        await subscriber().listen("x", hang, { maxRuntimeSeconds: 0.2, onFailed })
+
+        await waitFor(() => onFailed.mock.calls.length === 1)
+        expect(await row(id)).toMatchObject({ status: "failed", attempts: 1 })
+        const failed: FailedJob = onFailed.mock.calls[0][0]
+        expect(failed).toMatchObject({ id, attempts: 1, lastError: expect.stringMatching(/exceeded maxRuntimeSeconds/) })
+        expect(failed.error).toBeInstanceOf(RuntimeExceededError)
+    })
+
+    it("frees the slot so the next job runs", async () => {
+        const { publisher, subscriber, row } = setup()
+        await publisher.writeJob("x")
+        const next = await publisher.writeJob("x")
+        let runs = 0
+
+        await subscriber({ concurrency: 1 }).listen("x", async (job) => {
+            if(++runs === 1) return hang()
+            await job.complete()
+        }, { maxRuntimeSeconds: 0.2 })
+
+        await waitFor(async () => (await row(next.id)).status === "succeeded")
+    })
+
+    it("takes the subscriber's default, which a listen can override", async () => {
+        const { publisher, subscriber, row } = setup()
+        const limited = await publisher.writeJob("limited")
+        const longer = await publisher.writeJob("longer")
+        const s = subscriber({ maxRuntimeSeconds: 0.2 })
+
+        await s.listen("limited", hang, { maxRuntimeSeconds: undefined })
+        await s.listen("longer", async (job) => {
+            await sleep(400)
+            await job.complete()
+        }, { maxRuntimeSeconds: 5 })
+
+        await retrying(row, limited.id)
+        await waitFor(async () => (await row(longer.id)).status === "succeeded")
+    })
+
+    it("doesn't limit a handler when unset", async () => {
+        const { publisher, subscriber, row } = setup()
+        const { id } = await publisher.writeJob("x")
+
+        await subscriber().listen("x", async (job) => {
+            await sleep(400)
+            await job.complete()
+        })
+
+        await waitFor(async () => (await row(id)).status === "succeeded")
+    })
+
+    it("leaves a handler that finishes in time alone", async () => {
+        const { publisher, subscriber, row } = setup()
+        const { id } = await publisher.writeJob("x")
+        const logger = spyLogger()
+        let signal: AbortSignal | undefined
+
+        await subscriber({ logger }).listen("x", async (job) => {
+            signal = job.signal
+            await job.complete()
+        }, { maxRuntimeSeconds: 0.2 })
+        await waitFor(async () => (await row(id)).status === "succeeded")
+        await sleep(400)
+
+        expect(signal?.aborted).toBe(false)
+        expect(logger.warn).not.toHaveBeenCalled()
+        expect(logger.error).not.toHaveBeenCalled()
+    })
+
+    it("resolves a late ack from an abandoned handler with false, writes nothing and warns", async () => {
+        const { publisher, subscriber, row } = setup()
+        const { id } = await publisher.writeJob("x", { config: { maxRetries: 3, retryBackoffSeconds: 60 } })
+        const logger = spyLogger()
+        const release = gate()
+        const acks: boolean[] = []
+
+        await subscriber({ logger }).listen("x", async (job) => {
+            await release.opened
+            acks.push(await job.complete())
+            acks.push(await job.fail(new Error("late")))
+        }, { maxRuntimeSeconds: 0.2 })
+        const retried = await retrying(row, id)
+
+        release.open()
+        await waitFor(() => acks.length === 2)
+        expect(acks).toEqual([false, false])
+        expect(await row(id)).toEqual(retried)
+        expect(logger.warn).toHaveBeenCalledWith(expect.stringMatching(/abandoned/))
+    })
+
+    it("logs a rejection from an abandoned handler", async () => {
+        const { publisher, subscriber, row } = setup()
+        const { id } = await publisher.writeJob("x")
+        const logger = spyLogger()
+        const release = gate()
+
+        await subscriber({ logger }).listen("x", async () => {
+            await release.opened
+            throw new Error("finally gave up")
+        }, { maxRuntimeSeconds: 0.2 })
+        await retrying(row, id)
+
+        release.open()
+        await waitFor(() => logger.error.mock.calls.length === 1)
+        expect(logger.error).toHaveBeenCalledWith(expect.stringMatching(/abandoned/), new Error("finally gave up"))
+    })
+
+    it("lets stop() resolve once the limit is up, counting the attempt", async () => {
+        const { publisher, subscriber, row } = setup()
+        const { id } = await publisher.writeJob("x", { config: { maxRetries: 3, retryBackoffSeconds: 60 } })
+        let started = false
+        let reason: unknown
+        const s = subscriber()
+        await s.listen("x", (job) => {
+            started = true
+            job.signal.addEventListener("abort", () => (reason = job.signal.reason))
+            return hang()
+        }, { maxRuntimeSeconds: 0.5 })
+        await waitFor(() => started)
+
+        await s.stop()
+
+        expect(reason).toBeInstanceOf(SubscriberStoppedError)
+        const stopped = await row(id)
+        expect(stopped).toMatchObject({ status: "pending", attempts: 1 })
+        expect(stopped.last_error).toMatch(/exceeded maxRuntimeSeconds/)
+        expect(stopped.run_after.getTime() - stopped.updated_at.getTime()).toBe(60_000)
+    })
+
+    it("abandons a handler still running after its ack without writing anything more", async () => {
+        const { publisher, subscriber, row } = setup()
+        const { id } = await publisher.writeJob("x")
+        const next = await publisher.writeJob("x")
+        const logger = spyLogger()
+        let reason: unknown
+        let runs = 0
+
+        await subscriber({ logger, concurrency: 1 }).listen("x", async (job) => {
+            await job.complete()
+            if(++runs > 1) return
+            job.signal.addEventListener("abort", () => (reason = job.signal.reason))
+            return hang()
+        }, { maxRuntimeSeconds: 0.2 })
+
+        await waitFor(async () => (await row(next.id)).status === "succeeded")
+        expect(reason).toBeInstanceOf(RuntimeExceededError)
+        expect(await row(id)).toMatchObject({ status: "succeeded", attempts: 1, last_error: null })
+        expect(logger.warn).toHaveBeenCalledWith(expect.stringMatching(/abandoned/))
+    })
+
+    it("calls onFailed when a handler that failed the job for good then hangs is abandoned", async () => {
+        const { publisher, subscriber } = setup()
+        const { id } = await publisher.writeJob("x", { config: { maxRetries: 3 } })
+        const onFailed = jest.fn()
+        const boom = new Error("boom")
+
+        await subscriber().listen("x", async (job) => {
+            await job.fail(boom, { retry: false })
+            return hang()
+        }, { maxRuntimeSeconds: 0.2, onFailed })
+
+        await waitFor(() => onFailed.mock.calls.length === 1)
+        expect(onFailed.mock.calls[0][0]).toMatchObject({ id, lastError: "boom", error: boom })
+    })
+
+    it("abandons a handler whose lock was lost without writing or calling onFailed", async () => {
+        const { table, publisher, subscriber, row } = setup()
+        const { id } = await publisher.writeJob("x", { config: { lockTtlSeconds: 1, maxRetries: 0 } })
+        const onFailed = jest.fn()
+        let reason: unknown
+        let started = false
+        const s = subscriber()
+
+        await s.listen("x", async (job) => {
+            await db.admin.query(`UPDATE ${table} SET locked_by = 'another-worker' WHERE id = $1`, [job.id])
+            started = true
+            job.signal.addEventListener("abort", () => (reason = job.signal.reason))
+            return hang()
+        }, { maxRuntimeSeconds: 0.8, onFailed })
+        await waitFor(() => started)
+
+        await s.stop({ abort: false })
+
+        expect(reason).toBeInstanceOf(LockLostError)
+        expect(onFailed).not.toHaveBeenCalled()
+        expect(await row(id)).toMatchObject({ status: "running", attempts: 1, locked_by: "another-worker" })
     })
 })
 

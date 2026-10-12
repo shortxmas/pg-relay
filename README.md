@@ -174,6 +174,22 @@ await subscriber.listen("generate-report", async (job) => {
 
 The interrupted job goes straight back to the queue, without waiting out its lock and without using up a retry, so a deploy never fails a healthy job. `stop({ abort: false })` waits for handlers instead of aborting them. Reference: [`stop`](docs/subscriber.md#stop), [stop outcomes](docs/subscriber.md#stop-outcomes).
 
+### Limiting how long a job runs
+
+A handler that hangs on a call made without `job.signal` keeps its lock renewed forever. The job never retries, it holds a concurrency slot, and `stop()` waits on it until the pod is killed. Set `maxRuntimeSeconds` as a backstop:
+
+```ts
+await subscriber.listen("generate-report", async (job) => {
+  const report = await callModel(input, { signal: job.signal })
+  await saveReport(job.id, report)
+  await job.complete()
+}, { maxRuntimeSeconds: 1800 })
+// still running after 30 minutes → job.signal aborts with RuntimeExceededError,
+// the attempt fails, and the job retries after its backoff (or fails for good)
+```
+
+pg-relay stops waiting for the handler and frees its slot. A late `complete()` from it resolves `false`. Unset means no limit. Set it on `new Subscriber(queue, { maxRuntimeSeconds })` to apply it to every name. Reference: [run time limit](docs/subscriber.md#run-time-limit).
+
 ### Showing a job's progress
 
 Read a job back with `queue.getJob(id)`, or find jobs with `queue.listJobs({ name, status, payload, … })`. A [`JobRecord`](docs/job.md#jobrecordtpayload-tname) has everything a status page needs: `status`, `attempts`, `maxRetries`, `runAfter` (when a retry is due) and `lastError`. Reference: [`getJob`](docs/queue.md#getjob), [`listJobs`](docs/queue.md#listjobs), with a `describeJob` example.
