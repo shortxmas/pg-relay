@@ -1,4 +1,6 @@
+import { randomUUID } from "node:crypto"
 import { Pool } from "pg"
+import { parse } from "pg-connection-string"
 import { DEFAULT_JOB_CONFIG, Publisher } from "./publisher"
 import { PgQueue, PgRelayInitError } from "./queue"
 import { Subscriber } from "./subscriber"
@@ -106,6 +108,18 @@ describe("init", () => {
         const error = await queue(table).init().catch((e: unknown) => e)
         expect(error).toBeInstanceOf(PgRelayInitError)
         expect((error as Error).message).toMatch(/not a pg-relay table/)
+    })
+
+    it("tries again on the next call after a failed init", async () => {
+        // A database blip during the first call mustn't break the queue for the life of the process.
+        const pool = new Pool({ connectionString: DATABASE_URL })
+        defer(() => pool.end())
+        jest.spyOn(pool, "connect").mockImplementationOnce(() => Promise.reject(new Error("connection reset")))
+        const q = track(new PgQueue(tableName(), { pool }))
+
+        await expect(q.init()).rejects.toThrow(PgRelayInitError)
+        await expect(q.init()).resolves.toBeUndefined()
+        expect(q.init()).toBe(q.init())
     })
 
     it("rejects with the cause when the database is unreachable", async () => {
@@ -318,6 +332,30 @@ describe("schema", () => {
         await admin.query(`CREATE SCHEMA ${schema}`)
 
         await expect(schemaQueue(tableName(), schema).q.init()).resolves.toBeUndefined()
+    })
+
+    it("uses a schema it owns without CREATE on the database", async () => {
+        // A least-privilege app role: CONNECT on its database, and a schema made for it. Postgres
+        // checks the database's CREATE privilege before IF NOT EXISTS, so CREATE SCHEMA IF NOT EXISTS
+        // would fail here even though the schema exists.
+        const role = `r_${randomUUID().replaceAll("-", "").slice(0, 16)}`
+        const schema = schemaName()
+        await admin.query(`CREATE ROLE ${role} LOGIN PASSWORD 'pw'`)
+        await admin.query(`CREATE SCHEMA ${schema} AUTHORIZATION ${role}`)
+        const { rows } = await admin.query("SELECT has_database_privilege($1, current_database(), 'CREATE') AS can", [role])
+        expect(rows[0].can).toBe(false)
+
+        const pool = new Pool({ ...parse(DATABASE_URL), user: role, password: "pw" } as ConstructorParameters<typeof Pool>[0])
+        try{
+            const q = new PgQueue(tableName(), { pool, schema })
+            await expect(q.init()).resolves.toBeUndefined()
+            const { id } = await new Publisher(q).writeJob("x")
+            expect(await q.getJob(id)).not.toBeNull()
+        }finally{
+            await pool.end()
+            await admin.query(`DROP SCHEMA ${schema} CASCADE`)
+            await admin.query(`DROP ROLE ${role}`)
+        }
     })
 
     it("keeps tables of the same name in different schemas apart", async () => {
