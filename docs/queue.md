@@ -22,11 +22,11 @@ Constructing a queue does no I/O and doesn't read `DATABASE_URL`, so a module th
 
 | Option | Default | Meaning |
 |---|---|---|
-| `connectionString` | `process.env.DATABASE_URL` | Read when the queue first connects, not at construction. |
+| `connectionString` | `process.env.DATABASE_URL` | Read when the queue first connects, not at construction. Parsed by node-postgres, not libpq: `sslmode=require` verifies the server's certificate against Node's trusted CAs (add a private CA with `NODE_EXTRA_CA_CERTS`, e.g. Amazon RDS's bundle). Pass a `pool` to control TLS yourself. |
 | `pool` | none | An existing `pg.Pool` to use instead of opening one. `close()` leaves it open. |
 | `schema` | the connection's current schema, usually `public` | The Postgres schema for the table, created by `init()` if missing. A lowercase identifier of at most 63 characters, not starting with `pg_`. Otherwise the constructor throws. |
 
-A separate schema keeps the table away from tools that manage your app's schema, such as Prisma Migrate, which may report a table it didn't create as drift, or drop it on reset. With a schema, every query names `schema.table` directly, whatever the `search_path`. The database user needs permission to create the schema, or it has to exist already.
+A separate schema keeps the table away from tools that manage your app's schema, such as Prisma Migrate, which may report a table it didn't create as drift, or drop it on reset. With a schema, every query names `schema.table` directly, whatever the `search_path`. If the schema doesn't exist, the database user needs `CREATE` on the database to create it. If it already exists, `init()` doesn't try to create it, so a least-privilege role that only has `CONNECT` on the database works, as long as it can create tables in the schema (for example, the schema was made with `CREATE SCHEMA <name> AUTHORIZATION <role>`).
 
 ### Properties
 
@@ -45,7 +45,7 @@ queue.init(): Promise<void>
 
 Creates the table and its indexes if they're missing, then checks that an existing table has pg-relay's columns. You rarely need to call it: `writeJob`, `listen`, `getJob`, `listJobs`, `retryJob`, `pruneJobs` and `stats` all call it first.
 
-- It runs once per `PgQueue` instance. Later calls return the same promise, so **a failure stays failed**: construct a new queue to try again.
+- It succeeds once per `PgQueue` instance: later calls return the same promise. **A failure isn't kept**: once an init rejects, the next call (from `init` or any method that calls it) tries again, so a database blip on first use doesn't break the queue for the life of the process.
 - It runs in a transaction holding a Postgres advisory lock on the table's name, so many processes can start at once.
 - It never changes existing rows.
 - It rejects with `PgRelayInitError` when it can't connect, can't create the schema, table or indexes, or finds a table of that name that isn't a pg-relay table (missing columns are named in the message). The original error is on `cause`.

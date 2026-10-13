@@ -86,10 +86,14 @@ export class PgQueue<TName extends string = string>{
 
     /**
      * Creates the table and indexes if they don't exist, then checks the table has pg-relay's columns.
-     * Runs once per instance; later calls return the same promise, so a failure stays failed.
+     * Succeeds once per instance: later calls return the same promise. A failed init is forgotten once it
+     * rejects, so the next call tries again rather than failing for the life of the process.
      */
     init(): Promise<void>{
-        this.initialized ??= this.checkAndInitDatabase()
+        this.initialized ??= this.checkAndInitDatabase().catch((error: unknown) => {
+            this.initialized = undefined
+            throw error
+        })
         return this.initialized
     }
 
@@ -234,7 +238,12 @@ export class PgQueue<TName extends string = string>{
             await client.query("BEGIN")
             // Serializes init across processes: concurrent CREATE ... IF NOT EXISTS can still collide.
             await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [`pg-relay:${this.qualifiedTableName}`])
-            if(this.schema) await client.query(`CREATE SCHEMA IF NOT EXISTS ${this.schema}`)
+            // Only when it's missing: Postgres checks the database's CREATE privilege before IF NOT EXISTS,
+            // so a role that owns an existing schema but can't create schemas would otherwise fail here.
+            if(this.schema){
+                const { rows } = await client.query("SELECT 1 FROM pg_namespace WHERE nspname = $1", [this.schema])
+                if(rows.length === 0) await client.query(`CREATE SCHEMA IF NOT EXISTS ${this.schema}`)
+            }
             await client.query(createTableSql(this.qualifiedTableName))
 
             // Checked before the indexes, which would otherwise fail first on a foreign table's missing columns.
