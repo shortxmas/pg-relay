@@ -59,5 +59,10 @@
     "pg": "^8.23.1",
     "tsx": "^4.23.15",
     "typescript": "5.9.3"
+  },
+  "overrides": {
+    "@istanbuljs/load-nyc-config": {
+      "js-yaml": "^4.1.0"
+    }
   }
 }
