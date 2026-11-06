@@ -174,6 +174,29 @@ await subscriber.listen("generate-report", async (job) => {
 
 The interrupted job goes straight back to the queue, without waiting out its lock and without using up a retry, so a deploy never fails a healthy job. `stop({ abort: false })` waits for handlers instead of aborting them. Reference: [`stop`](docs/subscriber.md#stop), [stop outcomes](docs/subscriber.md#stop-outcomes).
 
+### Putting a job back without using an attempt
+
+Sometimes a handler can't run its job *right now* for a reason that has nothing to do with the job, such as a busy disk or a rate limit. `fail()` would use up an attempt, and waiting inside the handler holds a concurrency slot. `release()` puts the job back to `pending`, due again after an optional delay, with the attempt refunded:
+
+```ts
+await subscriber.listen("extract-spec", async (job) => {
+  const reservation = scratch.tryReserve(sizeOf(job.payload))
+  if (!reservation) {
+    // not this job's fault: the disk is busy with other jobs. Try again in a minute
+    await job.release({ delaySeconds: 60 })
+    return
+  }
+  try {
+    await extract(job.payload, { signal: job.signal })
+    await job.complete()
+  } finally {
+    reservation.free()
+  }
+})
+```
+
+pg-relay doesn't limit how often a job is released, so a handler that always releases keeps its job pending forever. Reference: [putting a job back](docs/subscriber.md#putting-a-job-back).
+
 ### Limiting how long a job runs
 
 A handler that hangs on a call made without `job.signal` keeps its lock renewed forever. The job never retries, it holds a concurrency slot, and `stop()` waits on it until the pod is killed. Set `maxRuntimeSeconds` as a backstop:

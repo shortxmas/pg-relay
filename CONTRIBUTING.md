@@ -43,6 +43,6 @@ Setup:
 |---|---|
 | `src/queue.ts` | `PgQueue`: connection, table creation |
 | `src/publisher.ts` | `Publisher.writeJob`, `DEFAULT_JOB_CONFIG` |
-| `src/subscriber.ts` | `Subscriber.listen`, claiming, lock renewal, `complete`/`fail` |
+| `src/subscriber.ts` | `Subscriber.listen`, claiming, lock renewal, `complete`/`fail`/`release` |
 | `src/job.ts` | Types: `JobConditions`, `JobConfig`, `JobPayload`, `JobRecord` |
 | `src/index.ts` | Public exports |
