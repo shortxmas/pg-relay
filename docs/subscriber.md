@@ -21,7 +21,7 @@ Constructing one does no I/O. It throws if the config is invalid (see [`ListenCo
 
 What gets logged:
 - `error`: a poll or claim query failed (the slot retries after `pollIntervalSeconds`), a handler threw after it had already finished its job, an abandoned handler threw, or an `onFailed` hook threw.
-- `warn`: renewing a lock failed (it's retried until the lock actually expires), an ack was dropped because the lock was lost, a handler was abandoned for exceeding `maxRuntimeSeconds`, or an abandoned handler called `complete`/`fail`.
+- `warn`: renewing a lock failed (it's retried until the lock actually expires), an ack was dropped because the lock was lost, a handler was abandoned for exceeding `maxRuntimeSeconds`, or an abandoned handler called `complete`/`fail`/`release`.
 
 ### `ListenConfig`
 
@@ -71,7 +71,7 @@ Each slot claims one job at a time, with a single `UPDATE … WHERE id = (SELECT
 
 ### Locks
 
-While the handler runs, the subscriber renews the lock every `lockTtlSeconds / 3`. If a renewal finds that another claim holds the job, its lock expired, for example during a long event-loop stall, and another worker took it over. `job.signal` then aborts with `LockLostError`, and this worker's `complete`/`fail` return `false` without writing anything.
+While the handler runs, the subscriber renews the lock every `lockTtlSeconds / 3`. If a renewal finds that another claim holds the job, its lock expired, for example during a long event-loop stall, and another worker took it over. `job.signal` then aborts with `LockLostError`, and this worker's `complete`/`fail`/`release` return `false` without writing anything.
 
 Pick `lockTtlSeconds` so that a stalled or dead worker is detected in an acceptable time. It doesn't need to cover the job's whole run time, because renewal extends it.
 
@@ -85,7 +85,7 @@ await subscriber.listen("generate-report", handler, { maxRuntimeSeconds: 1800 })
 
 The timer starts when the job is claimed. If the handler is still running when it fires:
 1. `job.signal` aborts with [`RuntimeExceededError`](#errors), unless it was already aborted, in which case the first reason stays.
-2. pg-relay stops waiting for the handler. A promise can't be cancelled, so the handler is **abandoned**: whatever it rejects with later goes to `logger.error`, and a later `complete`/`fail` resolves `false` and writes nothing.
+2. pg-relay stops waiting for the handler. A promise can't be cancelled, so the handler is **abandoned**: whatever it rejects with later goes to `logger.error`, and a later `complete`/`fail`/`release` resolves `false` and writes nothing.
 3. The attempt fails as if with `fail(new RuntimeExceededError(...))`: retried after its backoff if retries are left, otherwise `failed`, and `onFailed` fires. `lastError` reads `pg-relay: job <id> exceeded maxRuntimeSeconds (1800)`. This holds even when `stop()` aborted the job first: the attempt counts and isn't refunded, so a job that always hangs still runs out of retries.
 4. The slot is freed and claims the next job.
 
@@ -105,16 +105,18 @@ type ClaimedJob<TPayload, TName> = {
   signal: AbortSignal     // aborts with LockLostError, SubscriberStoppedError or RuntimeExceededError
   complete(): Promise<boolean>
   fail(error: unknown, options?: FailOptions): Promise<boolean>
+  release(options?: ReleaseOptions): Promise<boolean>
 }
 
-type FailOptions = { retry?: boolean }   // false fails now, even with retries left
+type FailOptions = { retry?: boolean }            // false fails now, even with retries left
+type ReleaseOptions = { delaySeconds?: number }   // whole seconds from 0 to 604800 (7 days); default 0
 ```
 
 `job.attempts > job.maxRetries` means this is the last attempt.
 
 ### Finishing a job
 
-Every job is finished by exactly one call to `complete` or `fail`. What the handler does decides the outcome:
+Every job is finished by exactly one ack: a call to `complete`, `fail` or `release`. What the handler does decides the outcome:
 
 | Handler | Result |
 |---|---|
@@ -122,15 +124,47 @@ Every job is finished by exactly one call to `complete` or `fail`. What the hand
 | Calls `fail(error)` with retries left | `pending`, due after [`retryDelaySeconds`](#retrydelayseconds)`(retryBackoffSeconds, attempts)` |
 | Calls `fail(error)` with none left | `failed` |
 | Calls `fail(error, { retry: false })` | `failed`, even with retries left |
+| Calls `release({ delaySeconds })` | `pending`, due after `delaySeconds` (default `0`), with `attempts` one lower: see [Putting a job back](#putting-a-job-back) |
 | Throws without finishing | Same as `fail(thrown)` |
 | Returns without finishing | Same as `fail(new Error("handler returned without calling complete or fail"))` |
 | Throws after finishing | Logged; the outcome stands |
-| Calls `complete`/`fail` a second time | That call throws |
+| Calls `complete`/`fail`/`release` a second time | That call throws |
 | Still running after `maxRuntimeSeconds` | Same as `fail(new RuntimeExceededError(...))`, and the handler is abandoned: see [Run time limit](#run-time-limit) |
 
-- `complete` and `fail` resolve `true` when the outcome was written, and `false` when it was dropped: this claim had lost the lock (the other worker's claim stands), or the handler was abandoned (the timeout already settled the attempt). Nothing is written in either case.
+- `complete`, `fail` and `release` resolve `true` when the outcome was written, and `false` when it was dropped: this claim had lost the lock (the other worker's claim stands), or the handler was abandoned (the timeout already settled the attempt). Nothing is written in either case.
 - `lastError` stores the error's `message` (or `String(error)` for a non-Error), truncated to 4096 characters. `complete()` leaves it unchanged.
 - **After a [stop](#stop) aborts the job**, the table differs: see [Stop outcomes](#stop-outcomes).
+
+### Putting a job back
+
+`release` is for a handler that can't run the job *right now* for a reason that isn't the job's fault, such as a busy resource:
+
+```ts
+await subscriber.listen("extract-spec", async (job) => {
+  if (!scratch.hasRoomFor(job.payload)) {
+    await job.release({ delaySeconds: 60 })   // try again in a minute, without using up an attempt
+    return
+  }
+  await extract(job.payload, { signal: job.signal })
+  await job.complete()
+})
+```
+
+What it writes, in one update that only lands while this claim still holds the job:
+
+| Column | Value |
+|---|---|
+| `status` | `pending` |
+| `attempts` | `attempts - 1`: the attempt this claim started is refunded |
+| `run_after` | `now() + delaySeconds` |
+| `locked_by`, `locked_until`, `finished_at` | `NULL` |
+| `last_error` | Unchanged: a release isn't a failure |
+
+- It's an ack like `complete` and `fail`: it stops the lock renewal, a later ack throws, and it resolves `false` (writing nothing) after a lost lock or an abandoned handler.
+- `onFailed` never fires for a release.
+- A job on its final attempt can be released. Its next run is that same final attempt again, not one past the limit.
+- `delaySeconds` must be a whole number from `0` to `604800` (7 days). Anything else rejects with `Error("pg-relay: delaySeconds must be a whole number from 0 to 604800, got …")` before anything is written. A rejected release isn't an ack: the job stays claimed, and the handler can still call `complete`, `fail` or `release`.
+- **pg-relay doesn't limit how often a job is released.** A handler that always releases keeps its job `pending` forever, so make sure whatever it waits on frees up, or count releases yourself (for example in your own table keyed by `job.id`) and `fail` the job past a limit. In [`stats()`](queue.md#stats), such jobs show as a high `pending` count with a low `oldestDueSeconds`, since each release moves `run_after` forward.
 
 ### `signal`
 
@@ -229,11 +263,12 @@ After a stop aborts a job:
 | Throws, or returns without finishing | Released |
 | Calls `fail(error)` | Released: a retryable failure after a stop is taken to be the stop |
 | Calls `fail(error, { retry: false })` | `failed`, and `onFailed` fires |
+| Calls `release({ delaySeconds })` | `pending`, due after `delaySeconds`: the release is written as asked, not replaced by the stop's due-now |
 | Still running after `maxRuntimeSeconds` | Not released: the attempt counts, as in [Run time limit](#run-time-limit) |
 
 **Released** means back to `pending`, due now with no backoff, with `attempts` one lower (the interrupted run doesn't count), `lastError` unchanged, and the lock cleared. `onFailed` doesn't fire. A job interrupted on its final attempt is released too, so a deploy never uses up a job's retries.
 
-This can't make a job loop forever. Only `stop()` refunds an attempt, and a worker that crashes or runs out of memory never gets that far, so its attempts still count. Neither does a handler that hangs past `maxRuntimeSeconds`.
+This can't make a job loop forever. Only `stop()` and `release()` refund an attempt, and a worker that crashes or runs out of memory never gets that far, so its attempts still count. Neither does a handler that hangs past `maxRuntimeSeconds`.
 
 ## Errors
 

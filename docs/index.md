@@ -6,7 +6,7 @@ The full reference for every export of `pg-relay`, one file per source module. T
 |---|---|---|
 | `src/queue.ts` | [queue.md](queue.md) | `PgQueue`, `PgQueueOptions`, `PgRelayInitError` |
 | `src/publisher.ts` | [publisher.md](publisher.md) | `Publisher`, `DEFAULT_JOB_CONFIG`, `WriteResult`, `WriteOptions`, `TransactionClient` |
-| `src/subscriber.ts` | [subscriber.md](subscriber.md) | `Subscriber`, `SubscriberConfig`, `ListenConfig`, `DEFAULT_LISTEN_CONFIG`, `SubscriberLogger`, `ClaimedJob`, `JobHandler`, `FailOptions`, `FailedJob`, `FailedHook`, `StopOptions`, `LockLostError`, `SubscriberStoppedError`, `RuntimeExceededError`, `retryDelaySeconds` |
+| `src/subscriber.ts` | [subscriber.md](subscriber.md) | `Subscriber`, `SubscriberConfig`, `ListenConfig`, `DEFAULT_LISTEN_CONFIG`, `SubscriberLogger`, `ClaimedJob`, `JobHandler`, `FailOptions`, `ReleaseOptions`, `FailedJob`, `FailedHook`, `StopOptions`, `LockLostError`, `SubscriberStoppedError`, `RuntimeExceededError`, `retryDelaySeconds` |
 | `src/job.ts` | [job.md](job.md) | `JobPayload`, `JsonValue`, `JobConfig`, `JobConditions`, `JobStatus`, `JobRecord`, `JobListFilter`, `PruneJobsOptions`, `JobStatsFilter`, `JobNameStats` |
 
 Everything is exported from the package root:
@@ -38,6 +38,8 @@ Both processes import the same module that constructs these three objects. Const
    │        running ───────────────────────────────┤
    │           │                                   │ released by stop()
    │           │                                   │ (run_after = now(), attempts − 1)
+   │           │                                   │ or job.release({ delaySeconds })
+   │           │                                   │ (run_after = now() + delay, attempts − 1)
    │           ├──── complete() ──────► succeeded  │
    │           │                                   │
    │           └──── fail, no retries left ──► failed ──► onFailed hook

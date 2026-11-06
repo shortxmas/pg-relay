@@ -309,6 +309,191 @@ describe("handler outcomes", () => {
     })
 })
 
+describe("release", () => {
+    it("puts the job back to pending after the delay, refunding the attempt and keeping last_error", async () => {
+        const { table, publisher, subscriber, row } = setup()
+        const { id } = await publisher.writeJob("x", { config: { maxRetries: 3, retryBackoffSeconds: 0 } })
+        // as if it already failed once
+        await db.admin.query(`UPDATE ${table} SET attempts = 1, last_error = 'earlier' WHERE id = $1`, [id])
+        let released: boolean | undefined
+        let claimedAttempts: number | undefined
+
+        await subscriber().listen("x", async (job) => {
+            claimedAttempts = job.attempts
+            released = await job.release({ delaySeconds: 60 })
+        })
+
+        await waitFor(() => released !== undefined)
+        await sleep(100)
+        expect(released).toBe(true)
+        expect(claimedAttempts).toBe(2)
+        const r = await row(id)
+        expect(r).toMatchObject({
+            status: "pending", attempts: 1, last_error: "earlier", locked_by: null, locked_until: null, finished_at: null,
+        })
+        expect(r.run_after.getTime() - r.updated_at.getTime()).toBe(60_000)
+    })
+
+    it("is due now without a delay: the next poll runs it again with the same attempts", async () => {
+        const { publisher, subscriber, row } = setup()
+        const { id } = await publisher.writeJob("x", { config: { maxRetries: 3 } })
+        const attempts: number[] = []
+
+        await subscriber().listen("x", async (job) => {
+            attempts.push(job.attempts)
+            if(attempts.length === 1) await job.release()
+            else await job.complete()
+        })
+
+        await waitFor(async () => (await row(id)).status === "succeeded")
+        expect(attempts).toEqual([1, 1])
+        expect((await row(id)).last_error).toBeNull()
+    })
+
+    it("releases a job on its final attempt, whose next run is that same attempt", async () => {
+        const { publisher, subscriber, row } = setup()
+        const { id } = await publisher.writeJob("x", { config: { maxRetries: 1, retryBackoffSeconds: 0 } })
+        const attempts: number[] = []
+        const onFailed = jest.fn()
+
+        await subscriber().listen("x", async (job) => {
+            attempts.push(job.attempts)
+            if(attempts.length === 1) await job.fail(new Error("flaky"))
+            else if(attempts.length === 2) await job.release()
+            else await job.complete()
+        }, { onFailed })
+
+        await waitFor(async () => (await row(id)).status === "succeeded")
+        expect(attempts).toEqual([1, 2, 2])
+        expect((await row(id)).attempts).toBe(2)
+        expect(onFailed).not.toHaveBeenCalled()
+    })
+
+    it("counts as the ack: a second ack throws either way round", async () => {
+        const { publisher, subscriber } = setup()
+        await publisher.writeJob("a")
+        await publisher.writeJob("b")
+        const errors: Record<string, unknown> = {}
+        const s = subscriber()
+
+        await s.listen("a", async (job) => {
+            await job.complete()
+            errors.a ??= await job.release().catch((error: unknown) => error)
+        })
+        await s.listen("b", async (job) => {
+            await job.release({ delaySeconds: 60 })
+            errors.b ??= await job.complete().catch((error: unknown) => error)
+        })
+
+        await waitFor(() => errors.a && errors.b)
+        expect((errors.a as Error).message).toMatch(/already completed or failed/)
+        expect((errors.b as Error).message).toMatch(/already completed or failed/)
+    })
+
+    it("resolves false and writes nothing once another worker holds the lock", async () => {
+        const { table, publisher, subscriber, row } = setup()
+        const { id } = await publisher.writeJob("x")
+        let released: boolean | undefined
+
+        await subscriber().listen("x", async (job) => {
+            await db.admin.query(`UPDATE ${table} SET locked_by = 'another-worker' WHERE id = $1`, [job.id])
+            released = await job.release()
+        })
+
+        await waitFor(() => released !== undefined)
+        expect(released).toBe(false)
+        expect(await row(id)).toMatchObject({ status: "running", attempts: 1, locked_by: "another-worker" })
+    })
+
+    it("resolves false and writes nothing from an abandoned handler", async () => {
+        const { publisher, subscriber, row } = setup()
+        const { id } = await publisher.writeJob("x", { config: { maxRetries: 3, retryBackoffSeconds: 60 } })
+        const late = gate()
+        let released: boolean | undefined
+
+        await subscriber().listen("x", async (job) => {
+            await late.opened
+            released = await job.release()
+        }, { maxRuntimeSeconds: 0.2 })
+        const retried = await waitFor(async () => {
+            const r = await row(id)
+            return r.status === "pending" && r.last_error && r
+        })
+
+        late.open()
+        await waitFor(() => released !== undefined)
+        expect(released).toBe(false)
+        expect(await row(id)).toEqual(retried)
+    })
+
+    it.each([-1, 1.5, 604_801, NaN])("rejects delaySeconds %p without acking, so the handler can still complete", async (delaySeconds) => {
+        const { publisher, subscriber, row } = setup()
+        const { id } = await publisher.writeJob("x")
+        let rejection: unknown
+        let during: Record<string, unknown> | undefined
+
+        await subscriber().listen("x", async (job) => {
+            rejection = await job.release({ delaySeconds }).then(() => "resolved", (error: unknown) => error)
+            during = await row(job.id)
+            await job.complete()
+        })
+
+        await waitFor(async () => (await row(id)).status === "succeeded")
+        expect(rejection).toBeInstanceOf(Error)
+        expect((rejection as Error).message).toBe(`pg-relay: delaySeconds must be a whole number from 0 to 604800, got ${delaySeconds}`)
+        expect(during).toMatchObject({ status: "running", attempts: 1 })
+    })
+
+    it("accepts the 7-day maximum", async () => {
+        const { publisher, subscriber, row } = setup()
+        const { id } = await publisher.writeJob("x")
+        let released: boolean | undefined
+
+        await subscriber().listen("x", async (job) => {
+            released = await job.release({ delaySeconds: 604_800 })
+        })
+
+        await waitFor(() => released)
+        const r = await row(id)
+        expect(r).toMatchObject({ status: "pending", attempts: 0 })
+        expect(r.run_after.getTime() - r.updated_at.getTime()).toBe(604_800_000)
+    })
+
+    it("doesn't call onFailed, even on the last attempt", async () => {
+        const { publisher, subscriber, row } = setup()
+        const { id } = await publisher.writeJob("x", { config: { maxRetries: 0 } })
+        const onFailed = jest.fn()
+
+        await subscriber().listen("x", (job) => job.release({ delaySeconds: 60 }), { onFailed })
+
+        await waitFor(async () => {
+            const r = await row(id)
+            return r.status === "pending" && r.attempts === 0
+        })
+        await sleep(100)
+        expect(onFailed).not.toHaveBeenCalled()
+    })
+
+    it("keeps its delay when made during stop(), and stop() resolves", async () => {
+        const { publisher, subscriber, row } = setup()
+        const { id } = await publisher.writeJob("x", { config: { maxRetries: 3 } })
+        let started = false
+        const s = subscriber()
+
+        await s.listen("x", async (job) => {
+            started = true
+            await new Promise<void>((resolve) => job.signal.addEventListener("abort", () => resolve(), { once: true }))
+            await job.release({ delaySeconds: 60 })
+        })
+        await waitFor(() => started)
+        await s.stop()
+
+        const r = await row(id)
+        expect(r).toMatchObject({ status: "pending", attempts: 0, locked_by: null })
+        expect(r.run_after.getTime() - r.updated_at.getTime()).toBe(60_000)
+    })
+})
+
 describe("locks", () => {
     it("locks a claimed job for its lockTtlSeconds", async () => {
         const { publisher, subscriber, row } = setup()

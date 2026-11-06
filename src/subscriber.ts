@@ -35,6 +35,11 @@ export type FailOptions = {
     retry?: boolean
 }
 
+export type ReleaseOptions = {
+    // seconds before the job is due again: a whole number from 0 to 604800 (7 days). Default 0 (due now)
+    delaySeconds?: number
+}
+
 /** A job the subscriber claimed, handed to the handler with the means to finish it. */
 export type ClaimedJob<TPayload extends JobPayload = JobPayload, TName extends string = string> = {
     id: string
@@ -50,6 +55,12 @@ export type ClaimedJob<TPayload extends JobPayload = JobPayload, TName extends s
     complete(): Promise<boolean>
     /** Retries the job after its backoff, or fails it when no retries are left or `retry` is false. */
     fail(error: unknown, options?: FailOptions): Promise<boolean>
+    /**
+     * Puts the job back to pending without using up an attempt, due again after `delaySeconds`. last_error
+     * is kept and onFailed isn't called. false when the outcome was dropped: the lock was lost, or the
+     * handler was abandoned. Rejects without finishing the job when `delaySeconds` is invalid.
+     */
+    release(options?: ReleaseOptions): Promise<boolean>
 }
 
 export type JobHandler<TPayload extends JobPayload = JobPayload, TName extends string = string> =
@@ -110,6 +121,8 @@ export function retryDelaySeconds(retryBackoffSeconds: number, attempts: number)
 }
 
 const MAX_ERROR_LENGTH = 4096
+// the longest delay pg-relay puts a job back for: 7 days
+const MAX_RETRY_DELAY_SECONDS = 604_800
 // the longest delay setTimeout takes; anything longer fires after 1ms
 const MAX_RUNTIME_SECONDS = Math.floor((2 ** 31 - 1) / 1000)
 const NO_ACK = "handler returned without calling complete or fail"
@@ -324,6 +337,13 @@ export class Subscriber<TName extends string = string>{
             signal: lock.signal,
             complete: () => ack(() => this.release(row.id, lockedBy, { status: "succeeded" })),
             fail,
+            release: async (options: ReleaseOptions = {}) => {
+                const { delaySeconds = 0 } = options
+                if(!(Number.isInteger(delaySeconds) && delaySeconds >= 0 && delaySeconds <= MAX_RETRY_DELAY_SECONDS)){
+                    throw new Error(`pg-relay: delaySeconds must be a whole number from 0 to ${MAX_RETRY_DELAY_SECONDS}, got ${delaySeconds}`)
+                }
+                return ack(() => this.requeue(row.id, lockedBy, delaySeconds))
+            },
         }
 
         const handled = (async () => {
@@ -386,21 +406,22 @@ export class Subscriber<TName extends string = string>{
     }
 
     /**
-     * Puts a job a stop interrupted back to pending, due now, refunding the attempt. last_error is kept.
-     * false when this claim no longer holds the job, in which case nothing changes.
+     * Puts a job back to pending, due after `delaySeconds`, refunding the attempt: after a stop interrupted
+     * it, or on job.release(). last_error is kept. false when this claim no longer holds the job, in which
+     * case nothing changes.
      */
-    private async requeue(id: string, lockedBy: string): Promise<boolean>{
+    private async requeue(id: string, lockedBy: string, delaySeconds = 0): Promise<boolean>{
         const { rowCount } = await this.queue.pool.query(
             `UPDATE ${this.queue.qualifiedTableName}
              SET status = 'pending',
                  attempts = attempts - 1,
-                 run_after = now(),
+                 run_after = now() + make_interval(secs => $3),
                  finished_at = NULL,
                  locked_by = NULL,
                  locked_until = NULL,
                  updated_at = now()
              WHERE id = $1 AND status = 'running' AND locked_by = $2`,
-            [id, lockedBy],
+            [id, lockedBy, delaySeconds],
         )
         return rowCount === 1
     }
